@@ -327,7 +327,24 @@ async function resolveOriginalArrivalDate(locId, sku) {
   }
 }
 
-async function moveInventoryItem(fromLoc, toLoc, sku, moveQty, isHubMove, instanceOrRowId, context) {
+/**
+ * @param {string} fromLoc source location id.
+ * @param {string} toLoc destination location id.
+ * @param {string} sku item SKU.
+ * @param {number} moveQty quantity to move.
+ * @param {boolean} isHubMove whether the source row is a bulk-hub row.
+ * @param {string|number} instanceOrRowId instance id or 1-based row index.
+ * @param {boolean} clientAssertsKnownCoordinate operator confirmed a real but
+ *   never-yet-used floor coordinate -- the client checked it against the
+ *   SVG-scraped slot list before calling in, so "no matching Inventory row" is
+ *   an empty slot rather than a typo. Matches moveHubGroup's parameter of the
+ *   same name and SRC/src/Service_Write.js:274. It had been dropped in the
+ *   port, with `context` occupying its position, which made every move to an
+ *   empty-but-real coordinate fail with "Unknown destination".
+ * @param {Object} context Express req, for Audit_Log attribution.
+ * @return {Promise<Object>} {success} or {success:false, error}.
+ */
+async function moveInventoryItem(fromLoc, toLoc, sku, moveQty, isHubMove, instanceOrRowId, clientAssertsKnownCoordinate, context) {
   const { planCaseConversion } = require('./Service_Conversions');
   // NaN would survive every comparison below (`NaN > currentFromQty` is false,
   // so the clamp never fires) and reach both the source and destination writes.
@@ -347,10 +364,19 @@ async function moveInventoryItem(fromLoc, toLoc, sku, moveQty, isHubMove, instan
     for (let i = 1; i < data.length; i++) {
       if (String(data[i][0] || '').toUpperCase() === toLocUpper) { knownLocation = data[i][0]; break; }
     }
-    if (knownLocation === null) {
+    if (knownLocation !== null) {
+      // Use the sheet's existing casing so a typo'd-case match (e.g.
+      // "swh-a-01" vs "SWH-A-01") resolves to the same physical row instead
+      // of forking it into a case-variant duplicate.
+      toLoc = knownLocation;
+    } else if (!clientAssertsKnownCoordinate) {
       return { success: false, error: `Unknown destination '${toLoc}' -- it doesn't match any existing location or recognized zone. Move rejected rather than creating a new one.` };
     }
-    toLoc = knownLocation;
+    // else: a real coordinate off the floor plan that simply has never
+    // received anything yet, so there is no row to match -- not a typo. Falls
+    // through with toLoc as the client-provided value; the destination-write
+    // path below appends a fresh row for it. Matches
+    // SRC/src/Service_Write.js:318-325.
   }
 
   let fromRowIdx = -1, currentFromQty = 0, resTag = "Open", softKitTag = "None", comTag = "";

@@ -669,7 +669,16 @@ async function getTrelloCardsByBoard_(boardId, creds) {
   return JSON.parse(res.text);
 }
 
-async function findOrCreatePOCardAndInject(parsedPO) {
+/**
+ * @param {Object} parsedPO the parsed PO (poNumber, vendor, lineItems).
+ * @param {string} [idLabel] an explicit label id picked in the ingest UI's
+ *   Customer Label dropdown. SRC/src/Service_Read.js:1211 takes this as its
+ *   second argument and TrelloInjector.html:786 passes it; the port had
+ *   dropped it.
+ * @return {Promise<Object>} {success, cardId, cardUrl, ...} or
+ *   {success:false, message}.
+ */
+async function findOrCreatePOCardAndInject(parsedPO, idLabel) {
   try {
     if (!parsedPO || !parsedPO.poNumber) return { success: false, message: 'Parsed PO is missing a PO number.' };
     if (!parsedPO.lineItems || parsedPO.lineItems.length === 0) return { success: false, message: 'No line items to inject.' };
@@ -701,15 +710,34 @@ async function findOrCreatePOCardAndInject(parsedPO) {
     const cardId = createRes.card.id;
     const cardUrl = createRes.card.shortUrl;
 
-    const VALID_TRELLO_LABEL_COLORS = ['green', 'yellow', 'orange', 'red', 'purple', 'blue', 'sky', 'lime', 'pink', 'black'];
-    if (parsedPO.labelColor && VALID_TRELLO_LABEL_COLORS.includes(parsedPO.labelColor)) {
-      // Stubbing addCardLabel since it is defined elsewhere or missing in this snippet
-      try {
-        await trelloFetch_(`${TRELLO_INJECTOR_CONFIG.BASE_URL}/cards/${cardId}/labels`, {
-          method: 'post', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ color: parsedPO.labelColor, name: parsedPO.vendor || 'PO', key: creds.key, token: creds.token })
-        });
-      } catch(e) {}
+    // Tag the new card with one of the board's EXISTING labels rather than
+    // minting a new one -- boards accumulate their own label vocab/casing over
+    // time (confirmed 2026-08-21: the Purchase Orders board already carries
+    // both "BURLINGTON INVENTORY" and a typo'd "BURLINTON INVENTORY" as
+    // separate labels), so blindly creating a label named after the vendor
+    // produced near-duplicates like a fresh "Nordstrom" next to the board's
+    // real "NORDSTROM". Priority: (1) idLabel, an explicit pick from the
+    // ingest UI's Customer Label dropdown, (2) an existing board label whose
+    // name matches the resolved vendor exactly (case-insensitive). No match on
+    // either -> leave the card unlabeled; someone applies the right label by
+    // hand rather than growing the board's label list further.
+    //
+    // The port had replaced all of this with a POST to /cards/{id}/labels
+    // carrying a colour and a name -- i.e. the label-creating behaviour SRC
+    // removed -- gated on `parsedPO.labelColor`, a field nothing in the parse
+    // path ever sets. Restored to SRC/src/Service_Read.js:1258-1281.
+    let resolvedLabelId = idLabel || '';
+    if (!resolvedLabelId && parsedPO.vendor) {
+      const boardLabels = await getTrelloBoardLabels(boardId);
+      if (boardLabels.success) {
+        const vendorUpper = String(parsedPO.vendor).trim().toUpperCase();
+        const match = boardLabels.labels.find(l => String(l.name).trim().toUpperCase() === vendorUpper);
+        if (match) resolvedLabelId = match.id;
+      }
+    }
+    if (resolvedLabelId) {
+      const addLabelUrl = `${TRELLO_INJECTOR_CONFIG.BASE_URL}/cards/${cardId}/idLabels?value=${encodeURIComponent(resolvedLabelId)}&key=${creds.key}&token=${creds.token}`;
+      await trelloFetch_(addLabelUrl, { method: 'post', muteHttpExceptions: true });
     }
 
     const mappedLineItems = parsedPO.lineItems.map(item => ({
