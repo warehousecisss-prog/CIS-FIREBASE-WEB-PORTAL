@@ -12,14 +12,18 @@ const cors = require('cors');
 const config = require("./config");
 const {attachIdentity, requireAuth} = require("./auth");
 const { sendPONotification } = require("./services/Service_Email");
-const Service_Read = require("./services/Service_Read");
 
 const app = express();
 // TODO: origin:true reflects any origin. Fine while every route is bearer-token
 // gated (a cross-origin page cannot read another origin's ID token), but tighten
 // to the Hosting domain before this carries anything cookie-authenticated.
 app.use(cors({ origin: true }));
-app.use(express.json());
+
+// 10mb, not the 100kb default. /po-ingest carries a base64-encoded PO PDF
+// (TrelloInjector.html reads the file with FileReader.readAsDataURL and posts
+// the payload), and the default limit would reject a scanned multi-page PO
+// with a 413 whose body says nothing about size.
+app.use(express.json({ limit: '10mb' }));
 
 // One warning line naming any required key with no value, emitted on the first
 // request rather than at module load. The emulator (and `firebase deploy`) load
@@ -39,6 +43,10 @@ app.use((req, res, next) => {
 // Verify the bearer token if one is present, then require an identity on every
 // route below. Enforcement is reject-with-401, per the 2026-08-28 auth decision;
 // AUTH_DISABLED=true bypasses it under the emulator only.
+//
+// These two stay on the app rather than moving into the routers: an
+// app.use() here cannot be forgotten by a new route module, whereas a
+// per-router requireAuth is one omission away from an open mutation endpoint.
 app.use(attachIdentity);
 app.use(requireAuth);
 
@@ -47,6 +55,7 @@ app.use(requireAuth);
  * end-to-end without performing a mutation.
  */
 app.get('/me', (req, res) => {
+  res.set('X-CIS-Route-Kind', 'read');
   res.json({
     success: true,
     email: req.auth.email,
@@ -55,40 +64,32 @@ app.get('/me', (req, res) => {
   });
 });
 
-app.get('/inventory', async (req, res) => {
-  try {
-    const inv = await Service_Read.getAllInventory();
-    const agingData = await Service_Read.getAgingData();
+// Every other route. See functions/http/routes/index.js for the registry and
+// PHASE_3_NOTES.md for the full call inventory.
+app.use(require('./http/routes'));
 
-    // Inject aging data into the array so frontend can read it
-    if (inv && Array.isArray(inv)) {
-      inv.forEach(row => {
-        const loc = String(row[0] || '').trim().toUpperCase();
-        if (agingData[loc] && agingData[loc].length > 0) {
-          const firstEntry = agingData[loc][0];
-          const diffTime = Math.abs(new Date() - new Date(firstEntry.date));
-          const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-          row.agingDays = diffDays;
-        } else {
-          row.agingDays = 0;
-        }
-      });
-    }
-    res.json(inv);
-  } catch (error) {
-    logger.error('Error fetching inventory:', error);
-    res.status(500).send('Internal Server Error');
-  }
+// Anything that reaches here matched no route. Answering JSON (rather than
+// Express's default HTML "Cannot POST /whatever" page) means the client's
+// error path gets a parseable body for a 404 the same as for a 422, so a
+// mistyped path reads as a mistyped path instead of a JSON parse error.
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    error: 'No route for ' + req.method + ' ' + req.path + '.'
+  });
 });
 
-app.get('/logistics-dashboard', async (req, res) => {
-  try {
-    const data = await Service_Read.getLogisticsDashboardData();
-    res.json(data);
-  } catch (error) {
-    logger.error('Error fetching logistics dashboard data:', error);
-    res.status(500).send('Internal Server Error');
-  }
+// Express's own error handler answers 500 with an HTML stack page, and for a
+// body-parser failure (malformed JSON, or a payload over the limit above) it
+// never reaches the wrappers at all. Same JSON envelope as everything else.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  logger.error('Unhandled error in the Express app', { error: err.message, stack: err.stack });
+  const status = err.status && err.status >= 400 && err.status < 600 ? err.status : 500;
+  res.status(status).json({
+    success: false,
+    error: err.message || 'Unhandled server error.'
+  });
 });
 
 exports.api = onRequest(app);
