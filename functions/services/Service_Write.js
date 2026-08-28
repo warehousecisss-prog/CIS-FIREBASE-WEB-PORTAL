@@ -1,6 +1,10 @@
 const SS_API = require('./Service_SheetsAPI');
 const logger = require('firebase-functions/logger');
 const { getActiveUserEmail } = require('../auth');
+// The Node stand-in for Apps Script's LockService.getScriptLock(), which has no
+// counterpart here. AUDIT_2026-08-24.md B7. Deliberately disposable -- see the
+// header of functions/lock.js before adding a second call site.
+const { withInventoryLock } = require('../lock');
 const {
   trelloCreds_,
   trelloFetch_,
@@ -72,10 +76,20 @@ function validateQty_(raw, label) {
  * from the caller anyway, and watched the UI repaint the old number. Matches
  * SRC/src/Service_Write.js:751-848.
  *
- * One remaining gap against SRC: there is no LockService equivalent around the
- * read-compute-write (AUDIT B7). Apps Script's LockService has no Node
- * counterpart; this needs a Firestore transaction or a distributed lock, which
- * is its own design decision. Tracked in PHASE_1_NOTES.md.
+ * Runs under the project-wide write lease (functions/lock.js), which is the
+ * Node stand-in for SRC's `LockService.getScriptLock()` at
+ * SRC/src/Service_Write.js:752 -- AUDIT_2026-08-24.md B7, SCHEMA invariant #59.
+ * The lock covers the WHOLE read-compute-write below: the row index is derived
+ * from the snapshot read on the first line, so protecting only the write would
+ * still let a row inserted or deleted in between send it to the wrong pallet.
+ * On contention this returns SRC's exact {success:false, error:"Server busy.
+ * Please try again."} without touching the sheet.
+ *
+ * The Phase 2 row-data-mismatch guard below is NOT made redundant by the lock
+ * and must stay: the lease only serialises OUR writers, and people edit this
+ * spreadsheet by hand in the Sheets UI. A row shifted by a human typing
+ * directly into it is invisible to any lock, and that guard is the only thing
+ * that catches it.
  *
  * @param {string} locId
  * @param {string} sku
@@ -85,6 +99,28 @@ function validateQty_(raw, label) {
  * @return {Promise<{success: boolean, error?: string}>}
  */
 async function modifySheetRow(locId, sku, instanceOrRowId, callback, context) {
+  return withInventoryLock(
+      () => modifySheetRowLocked_(locId, sku, instanceOrRowId, callback, context),
+      { label: 'modifySheetRow ' + (locId || '(no location)') + '/' + (sku || '(no SKU)') }
+  );
+}
+
+/**
+ * The body of modifySheetRow, with the lease already held.
+ *
+ * Split out only so the lock is one deletable line rather than an extra level
+ * of indentation over 100 lines -- see the disposability note in
+ * functions/lock.js. Never call this directly: it does the read-compute-write
+ * with no serialisation at all.
+ *
+ * @param {string} locId
+ * @param {string} sku
+ * @param {string|number} instanceOrRowId
+ * @param {Function} callback
+ * @param {Object} [context]
+ * @return {Promise<{success: boolean, error?: string}>}
+ */
+async function modifySheetRowLocked_(locId, sku, instanceOrRowId, callback, context) {
  try {
   const data = await SS_API.getSheetValues("Inventory!A:G");
   const cleanStr = (str) => str ? str.toString().replace(/(\r\n|\n|\r)/gm, "").trim() : "";
@@ -357,7 +393,15 @@ async function moveInventoryItem(fromLoc, toLoc, sku, moveQty, isHubMove, instan
   if (!toLoc) return { success: false, error: "Destination location is required." };
 
   const data = await SS_API.getSheetValues("Inventory!A:G");
-  const VIRTUAL_ZONES = ['ZONE-BUFFER', 'ZONE-STAGED'];
+  // ZONE-STAGED removed 2026-08-27 (SCHEMA v17 item 1, PHASE_3_NOTES F2) --
+  // staging is a workflow STATUS (column D), not a destination. Moving a pallet
+  // to a "ZONE-STAGED" location emptied its rack slot instead of recoloring it
+  // in place; both STAGED controls now call updateInventoryField(...,'status',
+  // 'Staged',...) instead. No client path can send a move here any more, so the
+  // server should reject one exactly as it would any other unrecognized
+  // destination rather than silently accepting it as always-vacant.
+  // Matches SRC/src/Service_Write.js:306 and moveHubGroup below.
+  const VIRTUAL_ZONES = ['ZONE-BUFFER'];
   const toLocUpper = toLoc.toUpperCase();
   if (!VIRTUAL_ZONES.includes(toLocUpper)) {
     let knownLocation = null;
@@ -686,9 +730,27 @@ async function stageBulkFedExTrackingNumbers(stagedItems) {
   return newRows.length;
 }
 
+/**
+ * ============================================================================
+ * ROW-LEVEL TARGETING -- the *ByRow twins
+ * ============================================================================
+ *
+ * SRC takes `LockService.getScriptLock()` inside each of these two directly
+ * (SRC/src/Service_Write.js:973 and :1027). Here they delegate to
+ * updateStock/setTotalStock, which delegate to modifySheetRow, which takes the
+ * lease -- so the lock is INHERITED rather than duplicated, and the two SRC
+ * sites are accounted for by the one at modifySheetRow.
+ *
+ * Taking a second lease here would be harmless (functions/lock.js is reentrant
+ * within a request, unlike Apps Script's) but it would be a lie about where the
+ * critical section is: the read-compute-write these are guarding happens inside
+ * modifySheetRow, not here.
+ *
+ * SRC's row-data-mismatch check ("Row data mismatch. The sheet may have been
+ * modified.") also lives in modifySheetRow's numeric branch for the same
+ * reason. See PHASE_2_NOTES.md §3.
+ */
 async function updateInventoryByRow(rowIdx, locId, sku, adjustment, context) {
-  // In Node.js environment, rowIdx mutations can easily race, 
-  // so this acts similarly to updateStock but enforces finding the exact row.
   return await updateStock(locId, sku, adjustment, rowIdx, context);
 }
 
@@ -874,10 +936,80 @@ async function receivePOCardItems(cardId, cardName, itemsReceived, context) {
     });
     
     htmlBody += '</ul></div>';
-      
-    if (rowsToAppend.length > 0) await SS_API.batchAppendRows("Inventory", rowsToAppend);
-    if (logRowsToAppend.length > 0) await SS_API.batchAppendRows("Audit_Log", logRowsToAppend);
-      
+
+    // =====================================================================
+    // LATE-STAGE LOCK -- SRC/src/Service_Write.js:1506, and the re-check that
+    // goes with it. Both were missing from this port entirely.
+    //
+    // "Late-stage" is the point (SCHEMA invariant #17): everything above --
+    // the Trello checklist read, the product-map lookup, building the rows,
+    // composing the receipt email -- runs UNLOCKED, because holding a
+    // project-wide lock across network calls would freeze every other station
+    // on the floor for the duration. Only the sheet write is serialised.
+    //
+    // The re-check is why the lock is here at all. Everything between the
+    // first checklist read at the top of this function and this line is a
+    // window in which another station could have received against the same
+    // card. If anything moved, abort before writing: no Inventory rows, no
+    // Audit_Log rows, no Trello writes. See AUDIT_2026-08-24.md B6 and SCHEMA
+    // invariant #53.
+    //
+    // This NARROWS the race, it does not eliminate it. The Trello checklist
+    // rewrite below happens OUTSIDE the lease, so two stations submitting
+    // within the same second can still both get here with matching reads.
+    // Closing that completely means holding the lock across ~2 Trello API
+    // calls per line item, which is exactly what invariant #17 forbids. SRC
+    // makes the same trade and records it in the same place.
+    //
+    // SRC uses waitLock(10000) here rather than tryLock(10000): a receipt that
+    // has already read Trello, resolved products and built its rows should
+    // wait its turn rather than throw the work away. withInventoryLock does
+    // exactly that -- it retries for ACQUIRE_TIMEOUT_MS (10s, the same budget)
+    // before answering "Server busy. Please try again."
+    // =====================================================================
+    const commit = await withInventoryLock(async () => {
+      const recheck = await readLiveChecklistState_(cardId);
+      if (!recheck) {
+        return {
+          success: false,
+          error: 'Could not re-verify this PO\'s checklist against Trello before ' +
+                 'writing. Nothing was received -- please retry.'
+        };
+      }
+      for (let i = 0; i < itemsReceived.length; i++) {
+        const item = itemsReceived[i];
+        if (!item.idCheckItem) continue; // nothing on the card to compare against
+        const current = recheck[item.idCheckItem];
+        if (!current) {
+          return {
+            success: false,
+            error: 'The line item "' + item.desc + '" is no longer on this PO\'s ' +
+                   'Trello checklist. Nothing was received -- please reload the PO ' +
+                   'and try again.'
+          };
+        }
+        if (current.qty !== item.oldQty || current.rcvd !== item.oldRcvd) {
+          return {
+            success: false,
+            error: 'Another station received against "' + item.desc + '" while this ' +
+                   'was being submitted (checklist now shows ' + current.rcvd +
+                   ' received of ' + (current.qty + current.rcvd) + '). Nothing was ' +
+                   'received -- please reload the PO and try again.'
+          };
+        }
+      }
+
+      if (rowsToAppend.length > 0) await SS_API.batchAppendRows("Inventory", rowsToAppend);
+      if (logRowsToAppend.length > 0) await SS_API.batchAppendRows("Audit_Log", logRowsToAppend);
+      return { success: true };
+    }, { label: 'receivePOCardItems commit (card ' + cardId + ')' });
+
+    // Covers all three refusals above plus the lock's own "Server busy". Every
+    // one of them means NOTHING was written, so returning here -- before the
+    // Trello half runs -- is what keeps the card and the sheet in step.
+    if (!commit.success) return commit;
+    const lockDegraded = commit.lockDegraded === true;
+
     // Post to Trello through the shared rate-limited transport.
     const { key: apiKey, token: apiToken } = trelloCreds_();
     
@@ -985,7 +1117,7 @@ async function receivePOCardItems(cardId, cardName, itemsReceived, context) {
       }
     }
 
-    return {
+    const outcome = {
       success: true,
       // false means the Inventory write landed but Trello did not fully catch
       // up -- the card still shows stale quantities and needs a manual fix.
@@ -997,6 +1129,12 @@ async function receivePOCardItems(cardId, cardName, itemsReceived, context) {
       poTotalRcvd: poTotalRcvd,
       poTotalExpected: poTotalExpected
     };
+    // Carried forward from the commit block: the rows landed, but the write
+    // lease could not be reached, so nothing was serialising this receipt
+    // against another station's. Surfaced rather than log-only -- see
+    // functions/lock.js.
+    if (lockDegraded) outcome.lockDegraded = true;
+    return outcome;
   } catch (e) {
     logger.error("receivePOCardItems failed", { error: e.toString() });
     return { success: false, error: e.toString() };
@@ -1471,7 +1609,13 @@ async function moveHubGroup(fromLoc, toLoc, instanceIds, clientAssertsKnownCoord
  * Splits part of a row's quantity onto a new row with its own workflow status
  * -- the Adjust popup's auto-split (SCHEMA v17 item 2).
  *
- * Parity with SRC/src/Service_Write.js:1100-1190.
+ * Parity with SRC/src/Service_Write.js:1100-1190, including its
+ * `LockService.getScriptLock()` at :1118 -- now the Firestore lease
+ * (functions/lock.js). Validation runs BEFORE the lease is taken, exactly as
+ * SRC orders it: a request rejected for a bad quantity or an unrecognized
+ * status never touches the sheet, so there is nothing to serialise, and holding
+ * the project-wide lock while deciding that would block every other station for
+ * no reason.
  *
  * @param {number} rowIdx 1-based Inventory row.
  * @param {string} locId
@@ -1499,6 +1643,25 @@ async function splitInventoryRow(rowIdx, locId, sku, splitQty, newStatus, contex
     return { success: false, error: "Unrecognized workflow status '" + newStatus + "'." };
   }
 
+  return withInventoryLock(
+      () => splitInventoryRowLocked_(rowIdx, locId, sku, splitQty, newStatus, context),
+      { label: 'splitInventoryRow row ' + rowIdx }
+  );
+}
+
+/**
+ * The body of splitInventoryRow, with the lease already held. Split out only so
+ * the lock is one deletable line -- see functions/lock.js. Never call directly.
+ *
+ * @param {number} rowIdx
+ * @param {string} locId
+ * @param {string} sku
+ * @param {number} splitQty already validated to a finite number > 0.
+ * @param {string} newStatus already validated against VALID_STATUSES.
+ * @param {Object} [context]
+ * @return {Promise<Object>}
+ */
+async function splitInventoryRowLocked_(rowIdx, locId, sku, splitQty, newStatus, context) {
   try {
     const data = await SS_API.getSheetValues("Inventory!A:G");
     const row = data[rowIdx - 1];

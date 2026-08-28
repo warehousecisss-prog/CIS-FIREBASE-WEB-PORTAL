@@ -4,7 +4,7 @@
 **Baseline commit:** `dd07a8f` (Antigravity's in-progress port, imported as-is)
 **Audited against:** original Apps Script repo at `SRC/src/` + `reference/SCHEMA.md` (v17)
 
-> **Status update 2026-08-28 — Phases 1, 2 and 3 complete.**
+> **Status update 2026-08-28 — Phases 1, 2 and 3 complete; Phase 4 in progress.**
 > - **Phase 1** (`PHASE_1_NOTES.md`): infra spine, C1–C5, auth decision.
 > - **Phase 2** (`PHASE_2_NOTES.md`): `Shared_Classifiers` ported and wired in,
 >   `Service_Write` and `Service_Read` brought to parity.
@@ -12,6 +12,10 @@
 >   all 64 server calls the original's client makes, behind one `runMutation`
 >   wrapper. 10 of those routes answer 501 because the service behind them is
 >   unported.
+> - **Phase 4, Unit A** (`PHASE_4_NOTES.md`): the write-path lock (AUDIT B7) —
+>   `functions/lock.js`, a Firestore lease behind one `withInventoryLock(fn)`.
+>   Also fixed F2 and restored the re-check-under-lock missing from
+>   `receivePOCardItems`.
 >
 > Sections below are annotated where they are now out of date. The next
 > bottleneck is **`Service_Dates` parity** (`estimateShipByDateV2`, SCHEMA §8
@@ -33,7 +37,7 @@
 | Firebase scaffold | ~~**Usable**~~ **Fixed (Phase 1)** | `.firebaserc`, shared `firebase-admin` init, `config.js`, auth middleware, ESLint config all added. Node engine now `22`. |
 | `Service_SheetsAPI` (SS_API) | ~~**Blocking bug**~~ **Fixed (Phase 1)** | Writes use `RAW` + `INSERT_ROWS`. Real gid resolution via `getSheetId()`. `getSpreadsheetId()` reads `BATCH_SHEET_ID`. |
 | `Service_Read` | ~~**~65%**~~ **~95% (Phase 2)** | Label management, shipping-reference r/w, SKU-last-updated map and the board matrix all ported. Only `testReadMPS` (a manual Logger harness) is absent. **Phase 3 found three more gaps:** `findOrCreatePOCardAndInject` was creating Trello labels and had lost `idLabel` (fixed, F3); `getAllInventory` drops the Instance_ID column (F5) and returns `null` where SRC rethrows (F6, AUDIT A4). |
-| `Service_Write` | ~~**~45%**~~ **~95% (Phase 2)** | A1 silent-failure fixed; 9 of 10 missing functions ported (`validateQty_`, `splitInventoryRow`, `moveHubGroup`, audit actions, …). B5/B6/A3 fixed. Only `testReceivingDataFlow` (a manual Logger harness) is absent. **Phase 3 found two more gaps:** `moveInventoryItem` had lost `clientAssertsKnownCoordinate` (fixed, F1) and still lists `ZONE-STAGED` as a virtual zone (F2). |
+| `Service_Write` | ~~**~45%**~~ **~95% (Phase 2)** | A1 silent-failure fixed; 9 of 10 missing functions ported (`validateQty_`, `splitInventoryRow`, `moveHubGroup`, audit actions, …). B5/B6/A3 fixed. Only `testReceivingDataFlow` (a manual Logger harness) is absent. **Phase 3 found two more gaps:** `moveInventoryItem` had lost `clientAssertsKnownCoordinate` (fixed, F1) and still listed `ZONE-STAGED` as a virtual zone (fixed, F2 — Phase 4). **Phase 4 also added the write lease and restored `receivePOCardItems`' missing re-check-under-lock.** |
 | `Service_Dates` | **~55%** | Forward ETA estimate ported. Reverse `estimateShipByDateV2` (SCHEMA §8 Engine 4), override detection, comment backfill, bot-account logic all missing. |
 | `Service_Conversions` | **~30%** | `planCaseConversion` shell ported; the case-breakdown / units-per-case engine (recent CHANGELOG work) is gone. |
 | `Service_Assembly` | **~60%** | build + explode ported; `explodePartialHub`, `commitInventoryMutation_`, `findEffectiveQtyPer_` missing. |
@@ -230,7 +234,8 @@ Still open:
 5. ~~**Build the HTTP route layer**~~ — **DONE 2026-08-28** (`PHASE_3_NOTES.md`).
    `functions/http/`, 71 routes, one `runMutation` wrapper, machine-checked
    against the 64 SRC client calls.
-6. **`Service_Dates` parity** incl. `estimateShipByDateV2`. **← next.** Also
+6. **`Service_Dates` parity** incl. `estimateShipByDateV2`. **← in progress
+   (Phase 4, Unit B).** Also
    picks up `estimateShippingWindowV2`'s lost `port` parameter and its missing
    `findTransitLane_` port-narrowing (Phase 3, F4).
 7. **Sync + webhook functions** (`syncAllBoardsToShipmentsTab`,
@@ -238,15 +243,21 @@ Still open:
 8. **Frontend**: real data wiring, then views one at a time
    (Dashboard → FedEx → Maps → Injector → Limbo/Staged).
 
-Steps 1–5 are done. Step 6 is the next bottleneck.
+Steps 1–5 are done. Step 6 is in progress (`PHASE_4_NOTES.md`), preceded by the
+write-path lock, which was blocking nothing but was blocking-adjacent to
+everything.
 
 Two gaps span everything above and are worth deciding on before much more is
 built on the write path:
 
-- **No lock anywhere on the write path (AUDIT B7).** SRC wraps `modifySheetRow`,
-  the `*ByRow` twins and `splitInventoryRow` in `LockService.tryLock(10000)`.
-  Apps Script's `LockService` has no Node counterpart, so this needs a Firestore
-  transaction or a distributed lock — its own design decision. The row-mismatch
-  guard added in Phase 2 narrows the window but does not close it.
+- ~~**No lock anywhere on the write path (AUDIT B7).**~~ **DONE (Phase 4,
+  Unit A).** `functions/lock.js` — a Firestore lease lock behind one
+  `withInventoryLock(fn)`, project-wide like SRC's, with a 60s TTL so a killed
+  container cannot wedge the write path. All five `Service_Write` lock sites are
+  covered; the two in `Fedex_Master_Script.js` and one in `Setup_Registry.js`
+  belong to unported files. The Phase 2 row-mismatch guard is **kept** — the
+  lease only serialises our own writers, not people hand-editing the sheet.
+  `npm run test:lock` (26 checks incl. real Firestore transactions).
+  **Firestore must be enabled on the project before deploy.**
 - **`SS_API.commitAtomic` not ported (AUDIT B3).** Its only callers are the
   assembly write paths, which are still unported.

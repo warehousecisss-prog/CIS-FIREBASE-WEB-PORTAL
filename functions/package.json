@@ -10,7 +10,9 @@
     "logs": "firebase functions:log",
     "test:parity": "node test/parity_Shared_Classifiers.js",
     "test:routes": "node test/routes_contract.js",
-    "test": "npm run test:parity && npm run test:routes"
+    "test:lock": "node test/lock_contract.js",
+    "test:lock:emulator": "firebase emulators:exec --only firestore --project cis-warehouse-portal \"node test/lock_contract.js\"",
+    "test": "npm run test:parity && npm run test:routes && npm run test:lock"
   },
   "engines": {
     "node": "22"

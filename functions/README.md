@@ -12,6 +12,7 @@ the doc disagree, the doc wins.
 | `admin.js` | The one and only `firebase-admin` `initializeApp()`. Require it for its side effect; never call `initializeApp()` anywhere else. |
 | `config.js` | Every runtime config key, with its description and the `SRC/src` line it came from. The only module that reads `process.env`. |
 | `auth.js` | Firebase Auth (Google provider) token verification, the domain allowlist, and `getActiveUserEmail()`. |
+| `lock.js` | The inventory write lease — the Node stand-in for Apps Script's `LockService`. Deliberately disposable; read its header before touching it. |
 | `services/` | Ported service modules. `Service_SheetsAPI.js` is the Sheets boundary; everything else goes through it. |
 
 ## Running locally
@@ -132,3 +133,37 @@ written (`AUDIT_2026-08-24.md` A1). `modifySheetRow()` returns
 `{success: false, error: 'Row not found for <loc>/<sku>…'}` when no row
 resolves, and every caller returns that verbatim. Do not add a caller that
 returns a hardcoded `{success: true}`.
+
+## The write lock
+
+`lock.js`. One export, `withInventoryLock(fn, {label})`, holding a **lease** in
+a single Firestore document (`_portal_locks/inventory`). It replaces
+`LockService.getScriptLock()`, which has no Node counterpart
+(`AUDIT_2026-08-24.md` B7, SCHEMA invariant #59). Project-wide, one writer at a
+time — the same scope the original used, because the write path resolves rows
+by scanning a full-sheet snapshot, so a per-row lock would not protect the scan
+that decides *which* row to take.
+
+Three things to know before touching it:
+
+- **It is deliberately disposable scaffolding.** The intended end state is
+  Postgres, which does this properly per row. Keep the whole mechanism behind
+  the one function so it deletes in one go. Do not add a second entry point.
+- **The lease expires (60s).** A Cloud Functions container can be frozen or
+  killed after responding, so `finally` is not a guarantee and a lock with no
+  expiry would wedge the write path permanently. If the function timeout is
+  ever raised above 60s, raise `LEASE_TTL_MS` to match.
+- **It fails OPEN, loudly.** If Firestore is unreachable the write proceeds
+  unlocked, logs an error, and carries `lockDegraded: true` on the result.
+  Refusing every write when the lock store is down would turn a
+  misconfiguration into a warehouse-wide outage, and it would announce itself
+  as "Server busy", which points at the wrong problem. *Contention* never fails
+  open.
+
+The row-data-mismatch guard in `modifySheetRow` is **not** made redundant by
+the lock and must stay: the lease only serialises our own writers, and people
+edit that spreadsheet by hand.
+
+Requires Firestore to be enabled on the project (Native mode). Verify with
+`npm run test:lock:emulator` — needs Java 21+ on `PATH`, no credentials, no
+real database.
