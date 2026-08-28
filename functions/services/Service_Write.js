@@ -1,5 +1,6 @@
 const SS_API = require('./Service_SheetsAPI');
 const logger = require('firebase-functions/logger');
+const { getActiveUserEmail } = require('../auth');
 
 /**
  * ============================================================================
@@ -8,10 +9,9 @@ const logger = require('firebase-functions/logger');
  * ============================================================================
  */
 
-// Helper to get active user equivalent in Firebase (would come from Auth context)
-function getActiveUserEmail(context) {
-  return context?.auth?.token?.email || "system@cis-portal.app";
-}
+// The Inventory tab title. Every delete path resolves this to a real numeric
+// gid at call time via SS_API.getSheetId() -- see PORT_AUDIT C4.
+const INVENTORY_SHEET = "Inventory";
 
 // Generate UUID substitute for Utilities.getUuid()
 function getUuid() {
@@ -21,12 +21,36 @@ function getUuid() {
 /**
  * Core helper that finds a row based on locId and sku (or instanceId)
  * and allows a callback to define what happens to it.
- * 
+ *
  * In GAS, this passed a "sheetWrapper" to simulate getRange().setValue().
  * In Node, we will read all data, find the row, let the callback define mutations,
  * and then run SS_API.batchUpdateValues / batchDeleteRows.
+ *
+ * ALWAYS returns a result object; never undefined. When no row resolves it
+ * returns {success:false, error:'Row not found for <loc>/<sku>...'} and every
+ * caller returns that verbatim. This is AUDIT_2026-08-24.md A1 / PORT_AUDIT C2:
+ * the version this replaces ended with a bare `if (targetRowIdx > -1) {...}`
+ * and no else, so an operator tapping SET on a pallet whose row had been
+ * shifted or deleted by the concurrent sync wrote nothing, got {success:true}
+ * from the caller anyway, and watched the UI repaint the old number. Matches
+ * SRC/src/Service_Write.js:751-848.
+ *
+ * Not yet at parity with SRC (Phase 2, tracked in PHASE_1_NOTES.md):
+ *  - no LockService equivalent around the read-compute-write (AUDIT B7). Apps
+ *    Script's LockService has no Node counterpart; this needs a Firestore
+ *    transaction or a distributed lock, which is its own design decision.
+ *  - the _SYS_ blob parse below is still an inline try/catch rather than
+ *    Shared_Classifiers' parseSysBlob_(), which is not ported yet (AUDIT A5).
+ *
+ * @param {string} locId
+ * @param {string} sku
+ * @param {string|number} instanceOrRowId instanceId, row number, or falsy.
+ * @param {Function} callback receives (sheetWrapper, rowIdx, itemsAtLoc).
+ * @param {Object} [context] Express req / callable context, for attribution.
+ * @return {Promise<{success: boolean, error?: string}>}
  */
 async function modifySheetRow(locId, sku, instanceOrRowId, callback, context) {
+ try {
   const data = await SS_API.getSheetValues("Inventory!A:G");
   const cleanStr = (str) => str ? str.toString().replace(/(\r\n|\n|\r)/gm, "").trim() : "";
   const targetLoc = cleanStr(locId);
@@ -73,10 +97,17 @@ async function modifySheetRow(locId, sku, instanceOrRowId, callback, context) {
     }
   }
   
-  if (targetRowIdx > -1) { 
+  if (targetRowIdx === -1) {
+    const err = 'Row not found for ' + (targetLoc || '(no location)') + '/' + (targetSku || '(no SKU)') +
+                '. The pallet may have been moved or deleted by another station.';
+    logger.warn('modifySheetRow: ' + err, { instanceOrRowId: instanceOrRowId });
+    return { success: false, error: err };
+  }
+
+  {
     let sheetUpdates = [];
     let rowsToDelete = [];
-    
+
     // Simulate the sheetWrapper passed in GAS
     const sheetWrapper = {
         getRange: function(row, col) {
@@ -96,20 +127,32 @@ async function modifySheetRow(locId, sku, instanceOrRowId, callback, context) {
         }
     };
 
-    // Assuming Inventory is the first sheet or we resolve its sheetId via metadata
-    // For now we pass a placeholder sheetId (0) which usually maps to the first sheet.
-    // In production, we'd fetch the sheetId via sheets.spreadsheets.get
-    const inventorySheetId = 0; 
+    // Awaited. Several callbacks are async (they append to Audit_Log), and the
+    // previous fire-and-forget call meant modifySheetRow could resolve before
+    // the audit write had left the process -- in Cloud Functions the container
+    // is free to freeze at that point, so the row simply never landed.
+    await callback(sheetWrapper, targetRowIdx, itemsAtLoc);
 
-    callback(sheetWrapper, targetRowIdx, itemsAtLoc);
-    
     if (sheetUpdates.length > 0) await SS_API.batchUpdateValues(sheetUpdates);
-    if (rowsToDelete.length > 0) await SS_API.batchDeleteRows(inventorySheetId, rowsToDelete);
+    if (rowsToDelete.length > 0) {
+      // Real gid, resolved once and cached. Never a hardcoded 0 -- see C4.
+      const inventorySheetId = await SS_API.getSheetId(INVENTORY_SHEET);
+      await SS_API.batchDeleteRows(inventorySheetId, rowsToDelete);
+    }
   }
+
+  return { success: true };
+ } catch (e) {
+  logger.error('modifySheetRow threw for ' + locId + '/' + sku, { error: e.message });
+  return { success: false, error: e.toString() };
+ }
 }
 
+// Returns modifySheetRow()'s own result verbatim -- this used to be a hardcoded
+// `return {success:true}` that fired even when no row matched (AUDIT A1).
+// Parity with SRC/src/Service_Write.js:220-244.
 async function setTotalStock(locId, sku, newQty, instanceOrRowId, context) {
-  await modifySheetRow(locId, sku, instanceOrRowId, async (sheet, rowIdx, itemsAtLoc) => {
+  return modifySheetRow(locId, sku, instanceOrRowId, async (sheet, rowIdx, itemsAtLoc) => {
     newQty = Number(newQty);
     const userEmail = getActiveUserEmail(context);
     
@@ -129,11 +172,11 @@ async function setTotalStock(locId, sku, newQty, instanceOrRowId, context) {
       await SS_API.batchAppendRows("Audit_Log", [[new Date().toISOString(), locId, sku, "SET_TOTAL", 0, newQty, userEmail]]);
     }
   }, context);
-  return { success: true };
 }
 
+// Same verbatim propagation as setTotalStock. Parity with SRC:246-271.
 async function updateStock(locId, sku, adjustment, instanceOrRowId, context) {
-  await modifySheetRow(locId, sku, instanceOrRowId, async (sheet, rowIdx, itemsAtLoc) => {
+  return modifySheetRow(locId, sku, instanceOrRowId, async (sheet, rowIdx, itemsAtLoc) => {
     const userEmail = getActiveUserEmail(context);
     const currentQty = Number(sheet.getRange(rowIdx, 3).getValue()) || 0;
     let newQty = currentQty + Number(adjustment);
@@ -154,7 +197,6 @@ async function updateStock(locId, sku, adjustment, instanceOrRowId, context) {
       await SS_API.batchAppendRows("Audit_Log", [[new Date().toISOString(), locId, sku, adjustment > 0 ? "ADD" : "REMOVE", adjustment, newQty, userEmail]]);
     }
   }, context);
-  return { success: true };
 }
 
 async function addNewItemToLocation(locId, sku, initialQty, context) {
@@ -418,7 +460,9 @@ async function moveInventoryItem(fromLoc, toLoc, sku, moveQty, isHubMove, instan
   }
 
   if (sheetUpdates.length > 0) await SS_API.batchUpdateValues(sheetUpdates);
-  if (rowsToDelete.length > 0) await SS_API.batchDeleteRows(0, rowsToDelete); // Assuming Sheet 0 is Inventory
+  if (rowsToDelete.length > 0) {
+    await SS_API.batchDeleteRows(await SS_API.getSheetId(INVENTORY_SHEET), rowsToDelete);
+  }
 
   const originalArrivalDate = await resolveOriginalArrivalDate(fromLoc, sku);
   const userEmail = getActiveUserEmail(context);
@@ -448,20 +492,24 @@ async function moveInventoryItem(fromLoc, toLoc, sku, moveQty, isHubMove, instan
   return { success: true };
 }
 
+// The three below return modifySheetRow()'s result verbatim (AUDIT A1).
+// updateInventoryField and updatePalletComment previously returned undefined
+// outright -- the client's `res.success !== false` check reads undefined as
+// success, so a comment saved onto a vanished row looked identical to one that
+// landed. Parity with SRC/src/Service_Write.js:674-724.
 async function updateInventoryField(locId, sku, fieldType, value, instanceOrRowId, context) {
-  await modifySheetRow(locId, sku, instanceOrRowId, (sheet, rowIdx) => {
+  return modifySheetRow(locId, sku, instanceOrRowId, (sheet, rowIdx) => {
     if (fieldType === 'status') sheet.getRange(rowIdx, 4).setValue(value);
     if (fieldType === 'assembly') sheet.getRange(rowIdx, 5).setValue(value);
   }, context);
 }
 
 async function updatePalletComment(locId, sku, commentText, instanceOrRowId, context) {
-  await modifySheetRow(locId, sku, instanceOrRowId, (sheet, rowIdx) => { sheet.getRange(rowIdx, 6).setValue(commentText); }, context);
+  return modifySheetRow(locId, sku, instanceOrRowId, (sheet, rowIdx) => { sheet.getRange(rowIdx, 6).setValue(commentText); }, context);
 }
 
-async function reservePallet(locId, sku, statusString, instanceOrRowId, context) { 
-  await modifySheetRow(locId, sku, instanceOrRowId, (sheet, rowIdx) => { sheet.getRange(rowIdx, 4).setValue(statusString); }, context);
-  return { success: true }; 
+async function reservePallet(locId, sku, statusString, instanceOrRowId, context) {
+  return modifySheetRow(locId, sku, instanceOrRowId, (sheet, rowIdx) => { sheet.getRange(rowIdx, 4).setValue(statusString); }, context);
 }
 
 async function cleanUpVacantRows() {
@@ -477,7 +525,7 @@ async function cleanUpVacantRows() {
   }
   
   if (rowsToDelete.length > 0) {
-    await SS_API.batchDeleteRows(0, rowsToDelete); // Assuming Sheet ID 0 is Inventory
+    await SS_API.batchDeleteRows(await SS_API.getSheetId(INVENTORY_SHEET), rowsToDelete);
   }
   return { success: true, deletedCount: rowsToDelete.length };
 }

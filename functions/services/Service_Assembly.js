@@ -1,11 +1,12 @@
 const SS_API = require('./Service_SheetsAPI');
-const { getUuid } = require('crypto');
 const { logger } = require('firebase-functions');
+const { getActiveUserEmail } = require('../auth');
 
-function getActiveUserEmail(context) {
-  return context && context.auth && context.auth.token && context.auth.token.email 
-    ? context.auth.token.email 
-    : 'portal-backend@automated.local';
+// Utilities.getUuid() equivalent. `crypto` exports randomUUID, not getUuid --
+// the previous `const { getUuid } = require('crypto')` destructured undefined,
+// so every call site below threw "getUuid is not a function" at runtime.
+function getUuid() {
+  return require('crypto').randomUUID();
 }
 
 async function getAssemblyData() {

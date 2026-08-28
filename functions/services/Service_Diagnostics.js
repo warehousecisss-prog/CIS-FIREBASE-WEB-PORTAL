@@ -1,17 +1,12 @@
 const SS_API = require('./Service_SheetsAPI');
 const { logger } = require('firebase-functions');
+const { getActiveUserEmailOrNull } = require('../auth');
 
 const EVENT_LOG_SHEET = "Event_Log";
 const EVENT_LOG_HEADERS = [
   "Timestamp", "Station", "User_Email", "Build_Version", "Current_View",
   "Note", "Error_Count", "Store_Summary", "Boot_Issues", "Environment", "Event_Trace"
 ];
-
-function getActiveUserEmail(context) {
-  return context && context.auth && context.auth.token && context.auth.token.email 
-    ? context.auth.token.email 
-    : 'portal-backend@automated.local';
-}
 
 async function submitDiagnosticReport(payload, context) {
   try {
@@ -42,7 +37,9 @@ async function submitDiagnosticReport(payload, context) {
       return k + '=' + s.state + '(age:' + (s.ageSeconds === null || s.ageSeconds === undefined ? 'never' : s.ageSeconds + 's') + ', n:' + s.size + ')';
     }).join('  |  ');
 
-    const userEmail = getActiveUserEmail(context);
+    // Telemetry, not a mutation: a crash report should still land when the
+    // caller's session has expired, so this uses the non-throwing accessor.
+    const userEmail = getActiveUserEmailOrNull(context) || 'unauthenticated';
     const bootIssues = Array.isArray(payload.bootIssues) ? payload.bootIssues : [];
 
     const row = [
