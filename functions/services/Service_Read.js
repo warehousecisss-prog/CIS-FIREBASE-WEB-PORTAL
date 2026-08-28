@@ -1,6 +1,12 @@
 const SS_API = require('./Service_SheetsAPI');
-const { getUuid } = require('crypto'); // If needed
 const { logger } = require('firebase-functions');
+const config = require('../config');
+const {
+  trelloCreds_,
+  trelloFetch_,
+  getBoardMatrix_,
+  parseSysBlob_
+} = require('./Shared_Classifiers');
 
 // --- Simple In-Memory Cache to replace Google CacheService ---
 const cacheStore = new Map();
@@ -266,12 +272,8 @@ async function getInventoryTotals() {
     data.forEach(row => {
       if (!row[1] || row[1] === "Vacant") return;
       
-      if (row[5] && row[5].toString().includes('_SYS_')) {
-         try {
-            const sysData = JSON.parse(row[5].toString().split('_SYS_')[1].trim());
-            if (sysData.t === 'B') return; 
-         } catch(e){}
-      }
+      const sysData = parseSysBlob_(row[5], 'Inventory row (getInventoryTotals)');
+      if (sysData && sysData.t === 'B') return;
 
       const rawSku = row[1].toString().trim();
       const skuKey = rawSku.toUpperCase();
@@ -517,10 +519,17 @@ async function getHeatmapWindowThresholds() {
  */
 
 function getTrelloInjectorCredentials() {
-  const key = process.env.TRELLO_KEY;
-  const token = process.env.TRELLO_TOKEN;
+  const { key, token } = trelloCreds_();
   if (!key || !token) return null;
   return { key, token };
+}
+
+/**
+ * The inbound Purchase Orders board. SRC/src/Service_Read.js:1396.
+ * @return {string}
+ */
+function getInboundPoBoardId_() {
+  return config.get('INBOUND_PO_BOARD_ID');
 }
 
 async function getSkuCatalog() {
@@ -549,15 +558,20 @@ async function getTrelloBoards() {
 
   const url = `${TRELLO_INJECTOR_CONFIG.BASE_URL}/members/me/boards?fields=name,url&filter=open&key=${creds.key}&token=${creds.token}`;
   try {
-    const res = await fetch(url);
+    const res = await trelloFetch_(url);
     if (res.ok) {
-      const allBoards = await res.json();
-      // TODO: Refactor getBoardMatrix_ to an export or constant here if available.
-      // For now returning all boards to prevent breaking, or assume getBoardMatrix is implemented elsewhere.
-      allBoards.sort((a, b) => a.name.localeCompare(b.name));
-      return { success: true, boards: allBoards };
+      // Filtered to the 4 boards in the matrix, matching SRC. Returning every
+      // board the token can see (what this did before Shared_Classifiers was
+      // ported) puts boards the sync pipeline knows nothing about into the
+      // injector's picker -- a card created on one of them is invisible to
+      // everything downstream. See SCHEMA section 2.
+      const allBoards = JSON.parse(res.text);
+      const knownIds = getBoardMatrix_().map(b => b.id);
+      const boards = allBoards.filter(b => knownIds.indexOf(b.id) !== -1);
+      boards.sort((a, b) => a.name.localeCompare(b.name));
+      return { success: true, boards: boards };
     } else {
-      const text = await res.text();
+      const text = res.text;
       return { success: false, message: 'Trello API Error: ' + text };
     }
   } catch (e) { return { success: false, message: 'Fetch Exception: ' + e.message }; }
@@ -570,12 +584,12 @@ async function getTrelloLists(boardId) {
 
   const url = `${TRELLO_INJECTOR_CONFIG.BASE_URL}/boards/${boardId}/lists?fields=name&filter=open&key=${creds.key}&token=${creds.token}`;
   try {
-    const res = await fetch(url);
+    const res = await trelloFetch_(url);
     if (res.ok) {
-      const lists = await res.json();
+      const lists = JSON.parse(res.text);
       return { success: true, lists: lists };
     } else {
-      return { success: false, message: 'Trello API Error: ' + await res.text() };
+      return { success: false, message: 'Trello API Error: ' + res.text };
     }
   } catch (e) { return { success: false, message: 'Fetch Exception: ' + e.message }; }
 }
@@ -587,13 +601,13 @@ async function getTrelloCardsByList(listId) {
 
   const url = `${TRELLO_INJECTOR_CONFIG.BASE_URL}/lists/${listId}/cards?fields=name,shortUrl&filter=open&key=${creds.key}&token=${creds.token}`;
   try {
-    const res = await fetch(url);
+    const res = await trelloFetch_(url);
     if (res.ok) {
-      const cards = await res.json();
+      const cards = JSON.parse(res.text);
       cards.sort((a, b) => a.name.localeCompare(b.name));
       return { success: true, cards: cards };
     } else {
-      return { success: false, message: 'Trello API Error: ' + await res.text() };
+      return { success: false, message: 'Trello API Error: ' + res.text };
     }
   } catch (e) { return { success: false, message: 'Fetch Exception: ' + e.message }; }
 }
@@ -605,16 +619,16 @@ async function createTrelloCard(listId, cardName) {
 
   const url = `${TRELLO_INJECTOR_CONFIG.BASE_URL}/cards`;
   try {
-    const res = await fetch(url, {
+    const res = await trelloFetch_(url, {
       method: 'post',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ idList: listId, name: cardName, key: creds.key, token: creds.token })
     });
     if (res.ok) {
-      const newCard = await res.json();
+      const newCard = JSON.parse(res.text);
       return { success: true, card: newCard };
     } else {
-      return { success: false, message: 'Trello API Error: ' + await res.text() };
+      return { success: false, message: 'Trello API Error: ' + res.text };
     }
   } catch (e) { return { success: false, message: 'Create Card Exception: ' + e.message }; }
 }
@@ -628,17 +642,17 @@ async function moveTrelloCard(cardId, idList, idBoard) {
   if (idBoard) url += `&idBoard=${idBoard}`;
 
   try {
-    const res = await fetch(url, { method: 'put' });
+    const res = await trelloFetch_(url, { method: 'put' });
     if (res.ok) return { success: true };
-    else return { success: false, message: 'Trello API Error: ' + await res.text() };
+    else return { success: false, message: 'Trello API Error: ' + res.text };
   } catch (e) { return { success: false, message: 'Move Card Exception: ' + e.message }; }
 }
 
 async function getTrelloCardsByBoard_(boardId, creds) {
   const url = `${TRELLO_INJECTOR_CONFIG.BASE_URL}/boards/${boardId}/cards?fields=name,shortUrl&filter=open&key=${creds.key}&token=${creds.token}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error('Trello API Error fetching board cards: ' + await res.text());
-  return await res.json();
+  const res = await trelloFetch_(url);
+  if (!res.ok) throw new Error('Trello API Error fetching board cards: ' + res.text);
+  return JSON.parse(res.text);
 }
 
 async function findOrCreatePOCardAndInject(parsedPO) {
@@ -649,7 +663,7 @@ async function findOrCreatePOCardAndInject(parsedPO) {
     const creds = getTrelloInjectorCredentials();
     if (!creds) return { success: false, message: 'Missing Trello credentials.' };
 
-    const boardId = process.env.INBOUND_PO_BOARD_ID || '649c805bad63086ff6689611';
+    const boardId = getInboundPoBoardId_();
     const poNumber = String(parsedPO.poNumber).trim();
     const poNumberRegex = new RegExp('\\b' + poNumber.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b');
 
@@ -677,7 +691,7 @@ async function findOrCreatePOCardAndInject(parsedPO) {
     if (parsedPO.labelColor && VALID_TRELLO_LABEL_COLORS.includes(parsedPO.labelColor)) {
       // Stubbing addCardLabel since it is defined elsewhere or missing in this snippet
       try {
-        await fetch(`${TRELLO_INJECTOR_CONFIG.BASE_URL}/cards/${cardId}/labels`, {
+        await trelloFetch_(`${TRELLO_INJECTOR_CONFIG.BASE_URL}/cards/${cardId}/labels`, {
           method: 'post', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ color: parsedPO.labelColor, name: parsedPO.vendor || 'PO', key: creds.key, token: creds.token })
         });
@@ -742,9 +756,9 @@ async function injectPOChecklist(cardId, lineItems) {
 async function getOrCreateInjectorChecklist(cardId, targetName, creds) {
   const getUrl = `${TRELLO_INJECTOR_CONFIG.BASE_URL}/cards/${cardId}/checklists?key=${creds.key}&token=${creds.token}`;
   try {
-    const getRes = await fetch(getUrl);
+    const getRes = await trelloFetch_(getUrl);
     if (getRes.ok) {
-      const checklists = await getRes.json();
+      const checklists = JSON.parse(getRes.text);
       const match = checklists.find(cl => cl.name.toLowerCase() === targetName.toLowerCase());
       if (match) return match.id;
     }
@@ -752,11 +766,11 @@ async function getOrCreateInjectorChecklist(cardId, targetName, creds) {
 
   const postUrl = `${TRELLO_INJECTOR_CONFIG.BASE_URL}/cards/${cardId}/checklists`;
   try {
-    const postRes = await fetch(postUrl, {
+    const postRes = await trelloFetch_(postUrl, {
       method: 'post', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: targetName, key: creds.key, token: creds.token })
     });
-    if (postRes.ok) return (await postRes.json()).id;
+    if (postRes.ok) return (JSON.parse(postRes.text)).id;
   } catch (e) {}
   return null;
 }
@@ -764,7 +778,7 @@ async function getOrCreateInjectorChecklist(cardId, targetName, creds) {
 async function addChecklistItemToInjectorTrello(checklistId, itemText, creds) {
   const url = `${TRELLO_INJECTOR_CONFIG.BASE_URL}/checklists/${checklistId}/checkItems`;
   try {
-    const res = await fetch(url, {
+    const res = await trelloFetch_(url, {
       method: 'post', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: itemText, checked: 'false', key: creds.key, token: creds.token })
     });
@@ -775,7 +789,7 @@ async function addChecklistItemToInjectorTrello(checklistId, itemText, creds) {
 async function updateChecklistItemInTrello(cardId, idCheckItem, itemText, creds) {
   const url = `${TRELLO_INJECTOR_CONFIG.BASE_URL}/cards/${cardId}/checkItem/${idCheckItem}?key=${creds.key}&token=${creds.token}`;
   try {
-    const res = await fetch(url, {
+    const res = await trelloFetch_(url, {
       method: 'put', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: itemText })
     });
@@ -786,7 +800,7 @@ async function updateChecklistItemInTrello(cardId, idCheckItem, itemText, creds)
 async function deleteChecklistItemInTrello(cardId, idCheckItem, creds) {
   const url = `${TRELLO_INJECTOR_CONFIG.BASE_URL}/cards/${cardId}/checkItem/${idCheckItem}?key=${creds.key}&token=${creds.token}`;
   try {
-    const res = await fetch(url, { method: 'delete' });
+    const res = await trelloFetch_(url, { method: 'delete' });
     return res.ok;
   } catch (e) { return false; }
 }
@@ -798,9 +812,9 @@ async function getExistingCardChecklist(cardId) {
 
   const url = `${TRELLO_INJECTOR_CONFIG.BASE_URL}/cards/${cardId}/checklists?key=${creds.key}&token=${creds.token}`;
   try {
-    const res = await fetch(url);
+    const res = await trelloFetch_(url);
     if (res.ok) {
-      const checklists = await res.json();
+      const checklists = JSON.parse(res.text);
       const poChecklist = checklists.find(cl => cl.name.toLowerCase() === TRELLO_INJECTOR_CONFIG.CHECKLIST_NAME.toLowerCase());
       if (!poChecklist || !poChecklist.checkItems) return { success: true, items: [] };
 
@@ -829,6 +843,7 @@ async function getExistingCardChecklist(cardId) {
 }
 
 module.exports = {
+  getInboundPoBoardId_,
   getLogisticsDashboardData,
   warmLogisticsDashboardCache,
   getAllInventory,

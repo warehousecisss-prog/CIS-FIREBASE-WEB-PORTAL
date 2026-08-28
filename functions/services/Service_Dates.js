@@ -1,5 +1,6 @@
 const SS_API = require('./Service_SheetsAPI');
 const { logger } = require('firebase-functions');
+const { trelloCreds_, trelloFetch_ } = require('./Shared_Classifiers');
 
 const SHIPMENTS_COL = {
   CARD_ID: 0, DIRECTION: 1, BOARD_SOURCE: 2, ENTITY: 3, TRANSIT_MODE: 4,
@@ -563,22 +564,18 @@ async function parseSailingScheduleComment_(commentText) {
   };
 }
 
-function trelloCreds_() {
-  return { key: process.env.TRELLO_KEY, token: process.env.TRELLO_TOKEN };
-}
-
 async function pushEtaToTrelloDue_(cardId, etaDateObj) {
   const creds = trelloCreds_();
   if (!creds.key || !creds.token || !cardId || !etaDateObj) return { success: false, error: "Missing Trello credentials, card ID, or ETA date." };
   try {
     const url = "https://api.trello.com/1/cards/" + cardId + "?key=" + creds.key + "&token=" + creds.token;
-    const res = await fetch(url, { 
+    const res = await trelloFetch_(url, { 
       method: "put", 
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ due: etaDateObj.toISOString() })
     });
     if (!res.ok) {
-        const txt = await res.text();
+        const txt = res.text;
         return { success: false, error: "Trello due-date write failed (" + res.status + "): " + txt };
     }
     return { success: true };
@@ -701,13 +698,13 @@ async function postReadyPortComment_(cardId, readyDateStr, portText) {
   const commentText = "READY " + readyDateStr + " PORT " + String(portText || "").toUpperCase();
   try {
     const url = "https://api.trello.com/1/cards/" + cardId + "/actions/comments?key=" + creds.key + "&token=" + creds.token;
-    const res = await fetch(url, { 
+    const res = await trelloFetch_(url, { 
       method: "post", 
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text: commentText }) 
     });
     if (!res.ok) {
-        const txt = await res.text();
+        const txt = res.text;
         return { success: false, error: "Trello comment post failed (" + res.status + "): " + txt };
     }
     return { success: true };
@@ -846,6 +843,10 @@ async function refreshAllShipmentDateStates() {
 }
 
 module.exports = {
+  // Exported because Shared_Classifiers' backfillIgnoreCommentsFromComments_
+  // needs the SHIPMENTS column map; SCHEMA section 3 is the contract for it.
+  SHIPMENTS_COL,
+  DATE_STATES,
   estimateShippingWindow,
   getTransitLaneCatalog,
   estimateShippingWindowV2,

@@ -1,6 +1,7 @@
 const SS_API = require('./Service_SheetsAPI');
 const logger = require('firebase-functions/logger');
 const { getActiveUserEmail } = require('../auth');
+const { trelloCreds_, trelloFetch_, parseSysBlob_ } = require('./Shared_Classifiers');
 
 /**
  * ============================================================================
@@ -81,14 +82,8 @@ async function modifySheetRow(locId, sku, instanceOrRowId, callback, context) {
       const rowSku = cleanStr(data[i][1]);
       
       if (rowLoc === targetLoc && rowSku === targetSku) {
-        let rCom = data[i][5] ? data[i][5].toString() : "";
-        let isHub = false;
-        if (rCom.includes('_SYS_')) {
-          try {
-            let sObj = JSON.parse(rCom.split('_SYS_')[1].trim());
-            if (sObj && sObj.t === 'B') isHub = true;
-          } catch(e){}
-        }
+        const sObj = parseSysBlob_(data[i][5], 'Inventory row ' + (i + 1));
+        const isHub = !!(sObj && sObj.t === 'B');
         if (!isHub) {
           targetRowIdx = i + 1;
           break;
@@ -299,9 +294,7 @@ async function moveInventoryItem(fromLoc, toLoc, sku, moveQty, isHubMove, instan
           softKitTag = data[i][4] || "None";
           comTag = data[i][5] || "";
           sourceInstanceId = data[i][6] || "";
-          if (comTag.includes('_SYS_')) {
-            try { sysData = JSON.parse(comTag.split('_SYS_')[1].trim()); } catch(e){}
-          }
+          sysData = parseSysBlob_(comTag, 'Inventory row ' + (i + 1));
           break;
        }
     }
@@ -313,23 +306,15 @@ async function moveInventoryItem(fromLoc, toLoc, sku, moveQty, isHubMove, instan
     softKitTag = data[i][4] || "None";
     comTag = data[i][5] || "";
     sourceInstanceId = data[i][6] || "";
-    if (comTag.includes('_SYS_')) {
-      try { sysData = JSON.parse(comTag.split('_SYS_')[1].trim()); } catch(e){}
-    }
+    sysData = parseSysBlob_(comTag, 'Inventory row ' + fromRowIdx);
   }
 
   if (fromRowIdx === -1) {
     for (let i = 1; i < data.length; i++) {
       if (data[i][0] === fromLoc && data[i][1] === sku) { 
-        let rCom = data[i][5] ? data[i][5].toString() : "";
         let rType = "normal";
-        let sObj = null;
-        if (rCom.includes('_SYS_')) {
-          try {
-            sObj = JSON.parse(rCom.split('_SYS_')[1].trim());
-            if (sObj && sObj.t) rType = sObj.t;
-          } catch(e){}
-        }
+        const sObj = parseSysBlob_(data[i][5], 'Inventory row ' + (i + 1));
+        if (sObj && sObj.t) rType = sObj.t;
         
         let matchCondition = isHubMove ? (rType === 'B') : (rType !== 'B');
         if (matchCondition && fromRowIdx === -1) {
@@ -400,10 +385,7 @@ async function moveInventoryItem(fromLoc, toLoc, sku, moveQty, isHubMove, instan
   if (sysData && sysData.t === 'B') {
     let destF = {};
     let remainingToAllocate = moveQty;
-    let origSysData = null;
-    if (comTag.includes('_SYS_')) {
-      try { origSysData = JSON.parse(comTag.split('_SYS_')[1].trim()); } catch(e){}
-    }
+    const origSysData = parseSysBlob_(comTag, 'Inventory row ' + fromRowIdx + ' (hub move source)');
     if (origSysData && origSysData.f) {
       for (let fLoc in origSysData.f) {
         if (remainingToAllocate <= 0) break;
@@ -415,20 +397,16 @@ async function moveInventoryItem(fromLoc, toLoc, sku, moveQty, isHubMove, instan
         for (let k = 1; k < data.length; k++) {
           if (data[k][0] === fLoc && data[k][1] === sku) {
             let frameComment = data[k][5] ? data[k][5].toString() : "";
-            if (frameComment.includes('_SYS_')) {
-              try {
-                let fSys = JSON.parse(frameComment.split('_SYS_')[1].trim());
-                if (fSys.t === 'F' && fSys.b && fSys.b[origSysData.p]) {
-                  let currentFromLocAlloc = fSys.b[origSysData.p][fromLoc] || 0;
-                  fSys.b[origSysData.p][fromLoc] = currentFromLocAlloc - allocated;
-                  if (fSys.b[origSysData.p][fromLoc] <= 0) delete fSys.b[origSysData.p][fromLoc];
-                  
-                  if (!fSys.b[origSysData.p][toLoc]) fSys.b[origSysData.p][toLoc] = 0;
-                  fSys.b[origSysData.p][toLoc] += allocated;
-                  
-                  sheetUpdates.push({ range: `Inventory!F${k+1}`, values: [[frameComment.split('_SYS_')[0].trim() + " _SYS_ " + JSON.stringify(fSys)]] });
-                }
-              } catch(e){}
+            let fSys = parseSysBlob_(frameComment, 'Inventory row ' + (k + 1) + ' (frame)');
+            if (fSys && fSys.t === 'F' && fSys.b && fSys.b[origSysData.p]) {
+              let currentFromLocAlloc = fSys.b[origSysData.p][fromLoc] || 0;
+              fSys.b[origSysData.p][fromLoc] = currentFromLocAlloc - allocated;
+              if (fSys.b[origSysData.p][fromLoc] <= 0) delete fSys.b[origSysData.p][fromLoc];
+
+              if (!fSys.b[origSysData.p][toLoc]) fSys.b[origSysData.p][toLoc] = 0;
+              fSys.b[origSysData.p][toLoc] += allocated;
+
+              sheetUpdates.push({ range: `Inventory!F${k+1}`, values: [[frameComment.split('_SYS_')[0].trim() + " _SYS_ " + JSON.stringify(fSys)]] });
             }
           }
         }
@@ -730,9 +708,8 @@ async function receivePOCardItems(cardId, cardName, itemsReceived, context) {
     if (rowsToAppend.length > 0) await SS_API.batchAppendRows("Inventory", rowsToAppend);
     if (logRowsToAppend.length > 0) await SS_API.batchAppendRows("Audit_Log", logRowsToAppend);
       
-    // Post to Trello using fetch
-    const apiKey = process.env.TRELLO_KEY;
-    const apiToken = process.env.TRELLO_TOKEN;
+    // Post to Trello through the shared rate-limited transport.
+    const { key: apiKey, token: apiToken } = trelloCreds_();
     
     if (apiKey && apiToken) {
       await Promise.all(itemsReceived.map(async (item) => {
@@ -744,7 +721,7 @@ async function receivePOCardItems(cardId, cardName, itemsReceived, context) {
           
           const url = `https://api.trello.com/1/cards/${cardId}/checkItem/${item.idCheckItem}?key=${apiKey}&token=${apiToken}`;
           try {
-            await fetch(url, {
+            await trelloFetch_(url, {
               method: 'put',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ name: newName, state: state })
@@ -756,7 +733,7 @@ async function receivePOCardItems(cardId, cardName, itemsReceived, context) {
       await Promise.all(trelloComments.map(async (comment) => {
         const url = `https://api.trello.com/1/cards/${cardId}/actions/comments?key=${apiKey}&token=${apiToken}`;
         try {
-          await fetch(url, {
+          await trelloFetch_(url, {
             method: 'post',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ text: comment })
@@ -775,25 +752,25 @@ async function receivePOCardItems(cardId, cardName, itemsReceived, context) {
     if (apiKey && apiToken && isPoFullyReceived && receivedAny) {
       try {
         const commentUrl = `https://api.trello.com/1/cards/${cardId}/actions/comments?key=${apiKey}&token=${apiToken}`;
-        await fetch(commentUrl, {
+        await trelloFetch_(commentUrl, {
             method: 'post',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ text: `🎉 PO #${cleanCardName} has been RECEIVED IN FULL! Total Quantity: ${poTotalRcvd} / ${poTotalExpected}. Ready for final QuickBooks bill closeout.` })
         });
 
-        const cardRes = await fetch(`https://api.trello.com/1/cards/${cardId}?fields=idBoard&key=${apiKey}&token=${apiToken}`);
+        const cardRes = await trelloFetch_(`https://api.trello.com/1/cards/${cardId}?fields=idBoard&key=${apiKey}&token=${apiToken}`);
         if (cardRes.ok) {
-          const cardData = await cardRes.json();
+          const cardData = JSON.parse(cardRes.text);
           const boardId = cardData.idBoard;
-          const listsRes = await fetch(`https://api.trello.com/1/boards/${boardId}/lists?key=${apiKey}&token=${apiToken}`);
+          const listsRes = await trelloFetch_(`https://api.trello.com/1/boards/${boardId}/lists?key=${apiKey}&token=${apiToken}`);
           if (listsRes.ok) {
-            const lists = await listsRes.json();
+            const lists = JSON.parse(listsRes.text);
             const deliveredList = lists.find(l => {
               const name = l.name.toLowerCase();
               return name.includes('delivered') || name.includes('done') || name.includes('received');
             });
             if (deliveredList) {
-              await fetch(`https://api.trello.com/1/cards/${cardId}?idList=${deliveredList.id}&key=${apiKey}&token=${apiToken}`, { method: 'put' });
+              await trelloFetch_(`https://api.trello.com/1/cards/${cardId}?idList=${deliveredList.id}&key=${apiKey}&token=${apiToken}`, { method: 'put' });
             }
           }
         }
@@ -855,8 +832,7 @@ async function markFedExChildDeliveredInSheet(tracking) {
 }
 
 async function processPackedOutboundCard(cardId) {
-  const trelloKey = process.env.TRELLO_KEY;
-  const trelloToken = process.env.TRELLO_TOKEN;
+  const { key: trelloKey, token: trelloToken } = trelloCreds_();
   
   if (!trelloKey || !trelloToken || !cardId) return { success: false, error: "Missing config or ID" };
   
@@ -864,35 +840,35 @@ async function processPackedOutboundCard(cardId) {
   
   try {
     const commentUrl = `https://api.trello.com/1/cards/${cardId}/actions/comments?key=${trelloKey}&token=${trelloToken}`;
-    await fetch(commentUrl, {
+    await trelloFetch_(commentUrl, {
       method: 'post',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text: `📦 **PACKED & STAGED** via CIS Portal at ${timestamp}` })
     });
 
     const labelUrl = `https://api.trello.com/1/cards/${cardId}/labels?key=${trelloKey}&token=${trelloToken}`;
-    await fetch(labelUrl, {
+    await trelloFetch_(labelUrl, {
       method: 'post',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ color: "orange", name: "PACKED" })
     });
 
-    const clRes = await fetch(`https://api.trello.com/1/cards/${cardId}/checklists?key=${trelloKey}&token=${trelloToken}`);
+    const clRes = await trelloFetch_(`https://api.trello.com/1/cards/${cardId}/checklists?key=${trelloKey}&token=${trelloToken}`);
     if (clRes.ok) {
-      const checklists = await clRes.json();
+      const checklists = JSON.parse(clRes.text);
       
       if (checklists.length === 0) {
-        const createRes = await fetch(`https://api.trello.com/1/cards/${cardId}/checklists?name=Status&key=${trelloKey}&token=${trelloToken}`, { method: 'post' });
+        const createRes = await trelloFetch_(`https://api.trello.com/1/cards/${cardId}/checklists?name=Status&key=${trelloKey}&token=${trelloToken}`, { method: 'post' });
         if (createRes.ok) {
-          const newCl = await createRes.json();
-          await fetch(`https://api.trello.com/1/checklists/${newCl.id}/checkItems?name=Packed&state=complete&checked=true&key=${trelloKey}&token=${trelloToken}`, { method: 'post' });
+          const newCl = JSON.parse(createRes.text);
+          await trelloFetch_(`https://api.trello.com/1/checklists/${newCl.id}/checkItems?name=Packed&state=complete&checked=true&key=${trelloKey}&token=${trelloToken}`, { method: 'post' });
         }
       } else {
         for (const cl of checklists) {
           if (cl.checkItems && cl.checkItems.length > 0) {
             for (const item of cl.checkItems) {
               if (item.state !== 'complete') {
-                await fetch(`https://api.trello.com/1/cards/${cardId}/checkItem/${item.id}?state=complete&key=${trelloKey}&token=${trelloToken}`, { method: 'put' });
+                await trelloFetch_(`https://api.trello.com/1/cards/${cardId}/checkItem/${item.id}?state=complete&key=${trelloKey}&token=${trelloToken}`, { method: 'put' });
               }
             }
           }

@@ -1,6 +1,7 @@
 const SS_API = require('./Service_SheetsAPI');
 const { logger } = require('firebase-functions');
 const { getActiveUserEmail } = require('../auth');
+const { parseSysBlob_ } = require('./Shared_Classifiers');
 
 // Utilities.getUuid() equivalent. `crypto` exports randomUUID, not getUuid --
 // the previous `const { getUuid } = require('crypto')` destructured undefined,
@@ -156,15 +157,11 @@ async function explodeAssembly(locId, sku, qty, instanceId = null, context) {
 
     for (let i = 1; i < data.length; i++) {
       if ((instanceId && data[i][6] === instanceId) || (!instanceId && data[i][0] === locId && data[i][1] === sku)) {
-        if (data[i][5] && data[i][5].toString().includes('_SYS_')) {
-          try {
-            let sysData = JSON.parse(data[i][5].toString().split('_SYS_')[1]);
-            if (sysData.t === "F") {
-              frameUuid = data[i][6] || instanceId;
-              assemblyRowIndex = i + 1;
-              break;
-            }
-          } catch(e) {}
+        const sysData = parseSysBlob_(data[i][5], 'Inventory row ' + (i + 1));
+        if (sysData && sysData.t === "F") {
+          frameUuid = data[i][6] || instanceId;
+          assemblyRowIndex = i + 1;
+          break;
         }
       }
     }
@@ -224,17 +221,13 @@ async function explodeAssembly(locId, sku, qty, instanceId = null, context) {
     let rowsToDelete = [assemblyRowIndex];
 
     for (let i = 1; i < data.length; i++) {
-       if (data[i][5] && data[i][5].toString().includes('_SYS_')) {
-          try {
-              let sysData = JSON.parse(data[i][5].toString().split('_SYS_')[1]);
-              if (sysData.t === "B" && sysData.pId === frameUuid) {
-                 rowsToDelete.push(i + 1);
-                 let bLoc = data[i][0];
-                 let cSku = sysData.cSku;
-                 let pullQty = Number(data[i][2]);
-                 restoreItemToSheet(bLoc, cSku, pullQty);
-              }
-          } catch(e) {}
+       const sysData = parseSysBlob_(data[i][5], 'Inventory row ' + (i + 1));
+       if (sysData && sysData.t === "B" && sysData.pId === frameUuid) {
+          rowsToDelete.push(i + 1);
+          let bLoc = data[i][0];
+          let cSku = sysData.cSku;
+          let pullQty = Number(data[i][2]);
+          restoreItemToSheet(bLoc, cSku, pullQty);
        }
     }
 
