@@ -1,9 +1,9 @@
-# Phase 4 — the write-path lock, and `Service_Dates` parity
+# Phase 4 — the write-path lock, `Service_Dates` parity, and the move locks
 
 **Date:** 2026-08-28
 **Baseline:** `371ac57` (end of Phase 3)
-**Scope:** two units. Unit A is the write-path lock (AUDIT B7). Unit B is
-`Service_Dates` parity.
+**Scope:** three units. Unit A is the write-path lock (AUDIT B7). Unit B is
+`Service_Dates` parity. Unit C locks the three move paths SRC leaves open.
 
 ---
 
@@ -314,13 +314,8 @@ path; it does not prove the resulting write reaches Google.
   FedEx engines' own `tryLock(10000)` fail and skip an entire cycle. The same
   reasoning applies to `withInventoryLock`: it is the same project-wide scope.
   Duplicate-webhook suppression is the event hash, not a lock.
-- **Three write paths SRC leaves unlocked are still unlocked here** —
-  `moveInventoryItem`, `moveHubGroup`, `removeItemFromLocation`. This is
-  faithful to SRC, but `moveInventoryItem` is arguably the most dangerous of the
-  lot: it reads the whole sheet, computes, and then does several writes, appends
-  and deletes. Adding `withInventoryLock` to them is now a one-line change each.
-  Deliberately **not** done — it is a behaviour change beyond the stated scope
-  and beyond what the original does. Flagged for a decision.
+- ~~**Three write paths SRC leaves unlocked are still unlocked here**~~ —
+  **DECIDED AND DONE 2026-08-28**, see §Unit C below.
 
 ---
 
@@ -608,3 +603,114 @@ in `functions/http/routes/shipping.js` is corrected too.
 - **`SS_API.commitAtomic` (AUDIT B3)** is still unported, and
   `SS_API.batchUpdateSheet` (added here) is the primitive it needs. It becomes
   blocking the moment `Service_Assembly` parity starts.
+
+---
+
+# UNIT C — locking the three move paths
+
+**Decided by you 2026-08-28**, after Unit A flagged it. This is the one place in
+the port that deliberately does **more** than SRC, so it is recorded separately
+rather than folded into Unit A.
+
+## Why SRC not having it is not a reason
+
+`LockService` appears nowhere in `moveInventoryItem`, `moveHubGroup` or
+`removeItemFromLocation` in `SRC/src/Service_Write.js`. Unit A therefore left
+them alone: matching the original is the default, and diverging from it is a
+decision, not a default.
+
+But of everything on this write path they have the **widest**
+read-compute-write. `moveInventoryItem` takes one full-sheet snapshot and then
+performs, off row indices derived from that single snapshot:
+
+- a source-row quantity update (or a vacate, or a delete),
+- a destination update *or* an append,
+- an `Audit_Log` append,
+- and for a hub move, the same again per component row.
+
+A concurrent SET on the same pallet lands inside that window and one of the two
+writes disappears with nobody told — which is precisely the failure AUDIT B7 is
+about. Closing it on the quantity paths while leaving it open on the widest one
+would have been a half-fix.
+
+`removeItemFromLocation` is worse in kind rather than in width: it **deletes
+rows**. A row index resolved from a snapshot that another writer has since
+shifted deletes the *wrong pallet*, rather than merely overwriting a number.
+
+## What changed
+
+Three call sites, same shape as Unit A's — the body renamed to
+`…Locked_` and the public function reduced to a `withInventoryLock(...)`
+wrapper, so the lock stays one deletable line per site when the Postgres
+migration removes `functions/lock.js` wholesale.
+
+**Validation stays outside the lease**, as it does for `splitInventoryRow`:
+
+- `moveInventoryItem` — `validateQty_` and the empty-destination check already
+  ran before the sheet read, and still do.
+- `moveHubGroup` — its two argument checks (`instanceIds` non-empty,
+  destination non-blank) were **hoisted above** the sheet read. SRC reads first
+  and validates second; neither check looks at the snapshot, so running them
+  first changes no answer, and it stops a request that is going to be refused
+  from holding the project-wide lock across a full-sheet read while being
+  refused.
+
+## What this costs
+
+An operator can now see *"Server busy. Please try again."* on a move. They
+could not before — because there was nothing to be busy with. That is the
+trade, and it is the same one Unit A made on the quantity paths.
+
+**If you ever diff this port against the original, expect this difference and
+know it was deliberate.** Every one of the six call sites carries a source
+comment saying so.
+
+## Verification
+
+`npm run test:lock` grew from 22 to 27 checks. The five new ones pin, for each
+of the three paths, that a held lease means **zero** sheet calls — not a failed
+write, no read either:
+
+```
+lock held: moveInventoryItem       -> {"success":false,"error":"Server busy. Please try again."}, sheet calls: 0
+lock held: moveHubGroup            -> {"success":false,"error":"Server busy. Please try again."}, sheet calls: 0
+lock held: removeItemFromLocation  -> {"success":false,"error":"Server busy. Please try again."}, sheet calls: 0
+```
+
+plus two that pin what must **not** have changed: validation still refuses a bad
+quantity or a blank destination in under a second with the lease held (i.e.
+without waiting the full 10s budget), and all three still reach the sheet
+normally when the lease is free.
+
+Reentrancy was re-checked across the newly-locked set: none of the three calls
+another locked function, and the only nesting anywhere on the write path is
+`processAuditAction` → `setTotalStock` → `modifySheetRow`, which
+`functions/lock.js` handles by design (SCHEMA invariant #59).
+
+| Check | Result |
+|---|---|
+| `npm run lint` | ✅ exit 0, the same 6 pre-existing warnings |
+| `npm run test:parity` | ✅ 1492 + 45850 comparisons, 0 differences |
+| `npm run test:routes` | ✅ 82 checks, 0 failures |
+| `npm run test:lock` | ✅ 27 checks, 0 failures |
+
+## Where the write lock now stands
+
+Every read-compute-write in `Service_Write.js` that touches Inventory runs under
+the lease:
+
+| Path | Lease | Source |
+|---|---|---|
+| `modifySheetRow` (and `setTotalStock`, `updateStock`, `updateInventoryField`, `updatePalletComment`, `reservePallet`, both `*ByRow` twins, `processAuditAction`) | ✅ | SRC |
+| `splitInventoryRow` | ✅ | SRC |
+| `receivePOCardItems` (late-stage) | ✅ | SRC |
+| `moveInventoryItem` | ✅ | **beyond SRC** |
+| `moveHubGroup` | ✅ | **beyond SRC** |
+| `removeItemFromLocation` | ✅ | **beyond SRC** |
+| `addNewItemToLocation` | ❌ | append-only — no read-compute-write to protect |
+| `cleanUpVacantRows` | ❌ | see below |
+
+`cleanUpVacantRows` is the one remaining gap and it is deliberate for now: it is
+a housekeeping sweep that deletes every row whose SKU is "Vacant", and it is
+unlocked in SRC too. It should probably take the lease as well — flagging rather
+than folding it in, since it was not part of what you approved.

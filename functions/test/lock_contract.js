@@ -708,6 +708,97 @@ async function partD() {
     say('  hand-edited sheet, lock free: -> ' + JSON.stringify(result));
   });
 
+  // ---- the three paths locked BEYOND SRC (2026-08-28) --------------------
+  // SRC leaves these unlocked. They are locked here deliberately: of everything
+  // on the write path they have the widest read-compute-write, and
+  // removeItemFromLocation deletes rows, so a stale index destroys the wrong
+  // pallet rather than merely overwriting a number. Pinned so a future "make it
+  // match SRC" edit has to argue with a failing test.
+  await check('moveInventoryItem takes the lease -- refused, sheet untouched', async () => {
+    const store = makeFakeStore();
+    __setStoreForTests(store);
+    await store.tryAcquire({ token: 'held', label: 'station-A' });
+    sheetCalls.length = 0;
+
+    const result = await Service_Write.moveInventoryItem(
+        'SWH-A-01', 'SWH-B-02', 'WIDGET-X-100', 5, false, 'inst-0001', true, CONTEXT);
+
+    assert.deepStrictEqual(result, { success: false, error: SERVER_BUSY_ERROR });
+    assert.deepStrictEqual(sheetCalls, [], sheetCalls.join(' | '));
+    say('  lock held: moveInventoryItem -> ' + JSON.stringify(result) +
+        ', sheet calls: ' + sheetCalls.length);
+  });
+
+  await check('moveInventoryItem validates BEFORE taking the lease', async () => {
+    const store = makeFakeStore();
+    __setStoreForTests(store);
+    await store.tryAcquire({ token: 'held', label: 'station-A' });
+    sheetCalls.length = 0;
+
+    // A bad quantity and a blank destination must both be refused instantly,
+    // not after a 10s wait behind another station's write.
+    const t0 = Date.now();
+    const badQty = await Service_Write.moveInventoryItem(
+        'SWH-A-01', 'SWH-B-02', 'WIDGET-X-100', '5o', false, 'inst-0001', true, CONTEXT);
+    const noDest = await Service_Write.moveInventoryItem(
+        'SWH-A-01', '', 'WIDGET-X-100', 5, false, 'inst-0001', true, CONTEXT);
+    const elapsed = Date.now() - t0;
+
+    assert.ok(/Move quantity must be a number/.test(badQty.error), badQty.error);
+    assert.strictEqual(noDest.error, 'Destination location is required.');
+    assert.ok(elapsed < 1000, 'validation waited ' + elapsed + 'ms on the lock');
+    assert.deepStrictEqual(sheetCalls, [], sheetCalls.join(' | '));
+  });
+
+  await check('moveHubGroup takes the lease, and its two argument checks are ' +
+              'hoisted above it', async () => {
+    const store = makeFakeStore();
+    __setStoreForTests(store);
+    await store.tryAcquire({ token: 'held', label: 'station-A' });
+    sheetCalls.length = 0;
+
+    const t0 = Date.now();
+    const nothing = await Service_Write.moveHubGroup('SWH-A-01', 'SWH-B-02', [], true, CONTEXT);
+    const noDest = await Service_Write.moveHubGroup('SWH-A-01', '', ['inst-0001'], true, CONTEXT);
+    const elapsed = Date.now() - t0;
+
+    assert.strictEqual(nothing.error, 'Nothing selected to move.');
+    assert.strictEqual(noDest.error, 'Destination location is required.');
+    assert.ok(elapsed < 1000, 'the hoisted checks waited ' + elapsed + 'ms on the lock');
+
+    const busy = await Service_Write.moveHubGroup(
+        'SWH-A-01', 'SWH-B-02', ['inst-0001'], true, CONTEXT);
+    assert.deepStrictEqual(busy, { success: false, error: SERVER_BUSY_ERROR });
+    assert.deepStrictEqual(sheetCalls, [], sheetCalls.join(' | '));
+    say('  lock held: moveHubGroup -> ' + JSON.stringify(busy) +
+        ', sheet calls: ' + sheetCalls.length);
+  });
+
+  await check('removeItemFromLocation takes the lease -- the delete path is ' +
+              'the one where a stale row index destroys the wrong pallet', async () => {
+    const store = makeFakeStore();
+    __setStoreForTests(store);
+    await store.tryAcquire({ token: 'held', label: 'station-A' });
+    sheetCalls.length = 0;
+
+    const result = await Service_Write.removeItemFromLocation(
+        'SWH-A-01', 'WIDGET-X-100', 'inst-0001', CONTEXT);
+
+    assert.deepStrictEqual(result, { success: false, error: SERVER_BUSY_ERROR });
+    assert.deepStrictEqual(sheetCalls, [], sheetCalls.join(' | '));
+    say('  lock held: removeItemFromLocation -> ' + JSON.stringify(result) +
+        ', sheet calls: ' + sheetCalls.length);
+  });
+
+  await check('all three still work normally with the lease free', async () => {
+    __setStoreForTests(makeFakeStore());
+    sheetCalls.length = 0;
+    const moved = await Service_Write.moveInventoryItem(
+        'SWH-A-01', 'ZONE-BUFFER', 'WIDGET-X-100', 5, false, 'inst-0001', false, CONTEXT);
+    assert.notStrictEqual(moved.error, SERVER_BUSY_ERROR);
+    assert.ok(sheetCalls.length > 0, 'the move never reached the sheet');
+  });
+
   await check('ZONE-STAGED is no longer a virtual move destination (F2)', async () => {
     __setStoreForTests(makeFakeStore());
     sheetCalls.length = 0;

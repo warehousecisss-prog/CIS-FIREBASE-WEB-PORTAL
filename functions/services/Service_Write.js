@@ -379,18 +379,55 @@ async function resolveOriginalArrivalDate(locId, sku) {
  *   empty-but-real coordinate fail with "Unknown destination".
  * @param {Object} context Express req, for Audit_Log attribution.
  * @return {Promise<Object>} {success} or {success:false, error}.
+ *
+ * RUNS UNDER THE WRITE LEASE, and this is a step BEYOND SRC, taken deliberately
+ * on 2026-08-28 rather than inherited. SRC leaves this function unlocked
+ * (`LockService` appears nowhere in it), but of everything on this write path it
+ * has the widest read-compute-write: one full-sheet snapshot, then a source-row
+ * update, a destination update or append, an Audit_Log append and sometimes a
+ * delete -- all keyed off row indices derived from that one snapshot. A
+ * concurrent SET on the same pallet lands inside that window and one of the two
+ * writes disappears silently, which is the exact failure AUDIT B7 is about;
+ * matching SRC here would have meant closing the hole on the quantity paths and
+ * leaving it open on the riskiest one. Same reasoning for moveHubGroup and
+ * removeItemFromLocation below.
  */
 async function moveInventoryItem(fromLoc, toLoc, sku, moveQty, isHubMove, instanceOrRowId, clientAssertsKnownCoordinate, context) {
-  const { planCaseConversion } = require('./Service_Conversions');
   // NaN would survive every comparison below (`NaN > currentFromQty` is false,
   // so the clamp never fires) and reach both the source and destination writes.
-  // See AUDIT_2026-08-24.md B5.
+  // See AUDIT_2026-08-24.md B5. Validated BEFORE the lease is taken, as
+  // splitInventoryRow does: a request that is going to be refused should not
+  // hold the project-wide lock while being refused.
   const qty = validateQty_(moveQty, "Move quantity");
   if (!qty.ok) return { success: false, error: qty.error };
   moveQty = qty.value;
   isHubMove = !!isHubMove;
   toLoc = String(toLoc || '').trim();
   if (!toLoc) return { success: false, error: "Destination location is required." };
+
+  return withInventoryLock(
+      () => moveInventoryItemLocked_(fromLoc, toLoc, sku, moveQty, isHubMove,
+          instanceOrRowId, clientAssertsKnownCoordinate, context),
+      { label: 'moveInventoryItem ' + (fromLoc || '?') + ' -> ' + toLoc }
+  );
+}
+
+/**
+ * The body of moveInventoryItem, with the lease already held. Split out only so
+ * the lock is one deletable line -- see functions/lock.js. Never call directly.
+ *
+ * @param {string} fromLoc
+ * @param {string} toLoc already trimmed and non-empty.
+ * @param {string} sku
+ * @param {number} moveQty already validated to a finite number.
+ * @param {boolean} isHubMove already coerced to a boolean.
+ * @param {string|number} instanceOrRowId
+ * @param {boolean} clientAssertsKnownCoordinate
+ * @param {Object} [context]
+ * @return {Promise<Object>}
+ */
+async function moveInventoryItemLocked_(fromLoc, toLoc, sku, moveQty, isHubMove, instanceOrRowId, clientAssertsKnownCoordinate, context) {
+  const { planCaseConversion } = require('./Service_Conversions');
 
   const data = await SS_API.getSheetValues("Inventory!A:G");
   // ZONE-STAGED removed 2026-08-27 (SCHEMA v17 item 1, PHASE_3_NOTES F2) --
@@ -1372,6 +1409,11 @@ async function markAuditComplete(targetSku) {
  *
  * Parity with SRC/src/Service_Write.js:108-210.
  *
+ * Runs under the write lease. A step beyond SRC -- see moveInventoryItem's
+ * comment for why. This one deletes rows, so a stale row index resolved from a
+ * snapshot another writer has since shifted destroys the WRONG pallet rather
+ * than merely overwriting a number.
+ *
  * @param {string} locId
  * @param {string} sku
  * @param {string|number} instanceOrRowId
@@ -1379,6 +1421,24 @@ async function markAuditComplete(targetSku) {
  * @return {Promise<{success: boolean, error?: string}>}
  */
 async function removeItemFromLocation(locId, sku, instanceOrRowId, context) {
+  return withInventoryLock(
+      () => removeItemFromLocationLocked_(locId, sku, instanceOrRowId, context),
+      { label: 'removeItemFromLocation ' + (locId || '?') + '/' + (sku || '?') }
+  );
+}
+
+/**
+ * The body of removeItemFromLocation, with the lease already held. Split out
+ * only so the lock is one deletable line -- see functions/lock.js. Never call
+ * directly.
+ *
+ * @param {string} locId
+ * @param {string} sku
+ * @param {string|number} instanceOrRowId
+ * @param {Object} [context]
+ * @return {Promise<{success: boolean, error?: string}>}
+ */
+async function removeItemFromLocationLocked_(locId, sku, instanceOrRowId, context) {
   try {
     const data = await SS_API.getSheetValues("Inventory!A:G");
 
@@ -1508,17 +1568,44 @@ async function removeItemFromLocation(locId, sku, instanceOrRowId, context) {
  *     never-stowed-to floor coordinate.
  * @param {Object} [context]
  * @return {Promise<{success: boolean, moved?: number, error?: string}>}
+ *
+ * Runs under the write lease. A step beyond SRC -- see moveInventoryItem's
+ * comment for why. It moves several rows at once, so the window between the
+ * snapshot and the last write is wider still.
+ *
+ * The two argument checks are hoisted ABOVE the lease. SRC reads the sheet
+ * first and validates second; neither check looks at `data`, so running them
+ * first changes no answer and keeps a request that is going to be refused from
+ * holding the project-wide lock across a full-sheet read while being refused.
  */
 async function moveHubGroup(fromLoc, toLoc, instanceIds, clientAssertsKnownCoordinate, context) {
+  if (!Array.isArray(instanceIds) || instanceIds.length === 0) {
+    return { success: false, error: "Nothing selected to move." };
+  }
+
+  toLoc = String(toLoc || '').trim();
+  if (!toLoc) return { success: false, error: "Destination location is required." };
+
+  return withInventoryLock(
+      () => moveHubGroupLocked_(fromLoc, toLoc, instanceIds, clientAssertsKnownCoordinate, context),
+      { label: 'moveHubGroup ' + (fromLoc || '?') + ' -> ' + toLoc }
+  );
+}
+
+/**
+ * The body of moveHubGroup, with the lease already held. Split out only so the
+ * lock is one deletable line -- see functions/lock.js. Never call directly.
+ *
+ * @param {string} fromLoc
+ * @param {string} toLoc already trimmed and non-empty.
+ * @param {Array<string>} instanceIds already checked non-empty.
+ * @param {boolean} clientAssertsKnownCoordinate
+ * @param {Object} [context]
+ * @return {Promise<{success: boolean, moved?: number, error?: string}>}
+ */
+async function moveHubGroupLocked_(fromLoc, toLoc, instanceIds, clientAssertsKnownCoordinate, context) {
   try {
     const data = await SS_API.getSheetValues("Inventory!A:G");
-
-    if (!Array.isArray(instanceIds) || instanceIds.length === 0) {
-      return { success: false, error: "Nothing selected to move." };
-    }
-
-    toLoc = String(toLoc || '').trim();
-    if (!toLoc) return { success: false, error: "Destination location is required." };
 
     // ZONE-STAGED removed 2026-08-27 -- staging is a status (column D), not a
     // destination; no client-side path can send a move here anymore, and the
