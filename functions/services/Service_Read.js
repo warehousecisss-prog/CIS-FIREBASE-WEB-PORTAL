@@ -5,7 +5,8 @@ const {
   trelloCreds_,
   trelloFetch_,
   getBoardMatrix_,
-  parseSysBlob_
+  parseSysBlob_,
+  PORTAL_IGNORED_MARKER
 } = require('./Shared_Classifiers');
 
 // --- Simple In-Memory Cache to replace Google CacheService ---
@@ -32,9 +33,14 @@ const CACHE_KEY_LOGISTICS = "LOGISTICS_DASHBOARD_PAYLOAD_V2";
 const CACHE_TTL_SECONDS = 21600;
 const CACHE_KEY_AGING = "AGING_DATA_PAYLOAD_V1";
 const CACHE_TTL_AGING_SECONDS = 300;
+const CACHE_KEY_SKU_LAST_UPDATED = "SKU_LAST_UPDATED_PAYLOAD_V1";
+const CACHE_TTL_SKU_LAST_UPDATED_SECONDS = 300;
 const BUILD_VERSION = "2026-08-13.1-NODEJS";
 
-const PORTAL_IGNORED_MARKER = "PORTAL_IGNORED_MARKER"; // Ensure this matches what Shared_Classifiers uses
+// Imported, never re-declared. This was a local literal spelled
+// "PORTAL_IGNORED_MARKER" while the real marker is "[PORTAL_IGNORED]", so the
+// dashboard's ignore filter matched nothing and every .ignore'd card kept
+// showing. See isCardIgnored_ in Shared_Classifiers.js.
 
 const TRELLO_INJECTOR_CONFIG = {
   CHECKLIST_NAME: 'PO Line Items',
@@ -419,6 +425,14 @@ async function getProductMap() {
     data.slice(1).forEach(row => {
       if (row[0]) {
         productMap[row[0].toString().trim()] = {
+          // The sheet's own column-A text, carried on the entry so callers that
+          // reach an entry through an uppercased or nickname-keyed index can
+          // still recover the canonical Product ID exactly as written -- needed
+          // by resolveCanonicalProductId_ (Shared_Classifiers.js), which decides
+          // what goes in Inventory's SKU column. Without this field that
+          // function silently falls through to the nickname, which is the exact
+          // identity drift it exists to prevent.
+          productId: row[0].toString().trim(),
           nickname: row[1] ? row[1].toString().trim() : row[0].toString().trim(),
           barcode: row[2] ? row[2].toString().trim() : ""
         };
@@ -842,8 +856,345 @@ async function getExistingCardChecklist(cardId) {
   return { success: true, items: [] };
 }
 
+/**
+ * ============================================================================
+ * SKU "LAST TOUCHED" MAP
+ * ============================================================================
+ * Deliberately NOT the same signal as buildAgingData_(). Aging answers "how
+ * long has this pallet physically sat here", so it counts arrival events only
+ * and ignores VERIFIED/adjustment rows. "When was this SKU's inventory last
+ * touched" is the opposite question: every action type counts, including those.
+ *
+ * Keyed by canonical SKU text (uppercased, trimmed) rather than the locId-keyed
+ * substring matching calculateInventoryAgeDays() needs -- Audit_Log's sku column
+ * is written as the canonical inventoryName at every write site (see
+ * receivePOCardItems()), so an exact match is correct and simpler here.
+ *
+ * Parity with SRC/src/Service_Read.js:667-708.
+ *
+ * @return {Promise<Object<string, string>>} uppercased SKU -> ISO timestamp.
+ */
+async function getSkuLastUpdatedMap() {
+  const cachedJson = getLargeCache_(CACHE_KEY_SKU_LAST_UPDATED);
+  if (cachedJson) {
+    try {
+      return JSON.parse(cachedJson);
+    } catch (e) {
+      logger.warn("SKU last-updated cache parse error. Rebuilding from sheet...");
+    }
+  }
+  const map = await buildSkuLastUpdatedMap_();
+  try {
+    putLargeCache_(CACHE_KEY_SKU_LAST_UPDATED, JSON.stringify(map), CACHE_TTL_SKU_LAST_UPDATED_SECONDS);
+  } catch (e) {
+    logger.warn("Could not warm SKU last-updated cache: " + e.message);
+  }
+  return map;
+}
+
+/**
+ * @return {Promise<Object<string, string>>} uppercased SKU -> newest ISO stamp.
+ */
+async function buildSkuLastUpdatedMap_() {
+  try {
+    const data = await SS_API.getSheetValues("Audit_Log!A:C");
+    if (!data || data.length < 2) return {};
+    const map = {};
+    for (let i = 1; i < data.length; i++) {
+      const row = data[i];
+      const rawTimestamp = row[0];
+      const sku = row[2] ? row[2].toString().trim() : "";
+      if (!sku || !rawTimestamp) continue;
+      const parsedDate = (rawTimestamp instanceof Date) ? rawTimestamp : new Date(Date.parse(rawTimestamp));
+      if (isNaN(parsedDate.getTime())) continue;
+      const key = sku.toUpperCase();
+      const iso = parsedDate.toISOString();
+      if (!map[key] || iso > map[key]) map[key] = iso;
+    }
+    return map;
+  } catch (e) {
+    logger.error("buildSkuLastUpdatedMap_ error", { error: e.message });
+    return {};
+  }
+}
+
+/**
+ * ============================================================================
+ * TRELLO LABEL MANAGEMENT (TrelloInjector)
+ * ============================================================================
+ */
+
+/**
+ * A board's actual existing labels (id/name/color), live from Trello -- used so
+ * the Injector can attach a card to a label the board already has instead of
+ * minting a new near-duplicate one.
+ *
+ * Parity with SRC/src/Service_Read.js:1406-1424.
+ *
+ * @param {string} boardId
+ * @return {Promise<{success: boolean, labels: Array<Object>, message?: string}>}
+ */
+async function getTrelloBoardLabels(boardId) {
+  if (!boardId) return { success: false, message: 'No Board ID provided.', labels: [] };
+  const creds = getTrelloInjectorCredentials();
+  if (!creds) return { success: false, message: 'Missing Trello credentials.', labels: [] };
+
+  try {
+    const url = `${TRELLO_INJECTOR_CONFIG.BASE_URL}/boards/${boardId}/labels?fields=name,color&limit=1000&key=${creds.key}&token=${creds.token}`;
+    const res = await trelloFetch_(url, { method: 'get' }, { label: 'board labels' });
+    if (!res.ok) {
+      return { success: false, message: 'Trello API error: ' + res.getContentText(), labels: [] };
+    }
+    const labels = JSON.parse(res.text)
+        .filter(l => l.name)
+        .sort((a, b) => a.name.localeCompare(b.name));
+    return { success: true, labels: labels };
+  } catch (e) {
+    return { success: false, message: 'getTrelloBoardLabels failed: ' + e.message, labels: [] };
+  }
+}
+
+/**
+ * Convenience wrapper for the PO Ingest modal's Customer Label dropdown, which
+ * always targets the fixed inbound PO board (same default as
+ * findOrCreatePOCardAndInject) and has no board picker of its own to read a
+ * board ID from client-side.
+ *
+ * @return {Promise<{success: boolean, labels: Array<Object>, message?: string}>}
+ */
+async function getInboundPoBoardLabels() {
+  return getTrelloBoardLabels(getInboundPoBoardId_());
+}
+
+/**
+ * The labels currently attached to a specific card -- used to pre-check the
+ * main Injector's Card Labels checkbox list when a card is selected.
+ *
+ * Parity with SRC/src/Service_Read.js:1441-1458.
+ *
+ * @param {string} cardId
+ * @return {Promise<{success: boolean, labels: Array<Object>, message?: string}>}
+ */
+async function getCardLabels(cardId) {
+  if (!cardId) return { success: false, message: 'No Card ID provided.', labels: [] };
+  const creds = getTrelloInjectorCredentials();
+  if (!creds) return { success: false, message: 'Missing Trello credentials.', labels: [] };
+
+  try {
+    const url = `${TRELLO_INJECTOR_CONFIG.BASE_URL}/cards/${cardId}/labels?fields=name,color&key=${creds.key}&token=${creds.token}`;
+    const res = await trelloFetch_(url, { method: 'get' }, { label: 'card labels' });
+    if (!res.ok) {
+      return { success: false, message: 'Trello API error: ' + res.getContentText(), labels: [] };
+    }
+    return { success: true, labels: JSON.parse(res.text) };
+  } catch (e) {
+    return { success: false, message: 'getCardLabels failed: ' + e.message, labels: [] };
+  }
+}
+
+/**
+ * Syncs a card's labels to exactly the given set of label IDs -- backs the main
+ * Injector's manual Card Labels checkbox list. Diffs against the card's current
+ * labels (via getCardLabels()) so only what actually changed makes an API call,
+ * rather than a blind clear-then-reapply.
+ *
+ * Unlike SRC this reports per-call failures rather than assuming each write
+ * landed: every one of these goes through trelloFetch_, so a 429 is already
+ * retried, and what survives that is a real failure worth surfacing.
+ *
+ * Parity with SRC/src/Service_Read.js:1464-1490.
+ *
+ * @param {string} cardId
+ * @param {Array<string>} labelIds
+ * @return {Promise<Object>}
+ */
+async function updateCardLabels(cardId, labelIds) {
+  if (!cardId) return { success: false, message: 'No Card ID provided.' };
+  const creds = getTrelloInjectorCredentials();
+  if (!creds) return { success: false, message: 'Missing Trello credentials.' };
+
+  const desired = Array.isArray(labelIds) ? labelIds : [];
+  const currentRes = await getCardLabels(cardId);
+  if (!currentRes.success) return { success: false, message: currentRes.message };
+
+  const currentIds = currentRes.labels.map(l => l.id);
+  const toAdd = desired.filter(id => !currentIds.includes(id));
+  const toRemove = currentIds.filter(id => !desired.includes(id));
+
+  try {
+    const failed = [];
+
+    for (const id of toAdd) {
+      const url = `${TRELLO_INJECTOR_CONFIG.BASE_URL}/cards/${cardId}/idLabels?value=${encodeURIComponent(id)}&key=${creds.key}&token=${creds.token}`;
+      const res = await trelloFetch_(url, { method: 'post' }, { label: 'add card label' });
+      if (!res.ok) failed.push({ id: id, action: 'add', reason: res.error || ('HTTP ' + res.code) });
+    }
+    for (const id of toRemove) {
+      const url = `${TRELLO_INJECTOR_CONFIG.BASE_URL}/cards/${cardId}/idLabels/${id}?key=${creds.key}&token=${creds.token}`;
+      const res = await trelloFetch_(url, { method: 'delete' }, { label: 'remove card label' });
+      if (!res.ok) failed.push({ id: id, action: 'remove', reason: res.error || ('HTTP ' + res.code) });
+    }
+
+    if (failed.length > 0) {
+      return {
+        success: false,
+        message: failed.length + ' label change(s) failed on Trello.',
+        failed: failed,
+        added: toAdd.length - failed.filter(f => f.action === 'add').length,
+        removed: toRemove.length - failed.filter(f => f.action === 'remove').length
+      };
+    }
+    return { success: true, added: toAdd.length, removed: toRemove.length };
+  } catch (e) {
+    return { success: false, message: 'updateCardLabels failed: ' + e.message };
+  }
+}
+
+/**
+ * Deep link to the standalone Injector page.
+ *
+ * SRC returns `ScriptApp.getService().getUrl() + '?page=injector'` -- the Apps
+ * Script web-app URL, which the runtime knows about itself. Cloud Functions has
+ * no equivalent: the backend does not know the Hosting domain it is served
+ * behind. So this derives the origin from the incoming request when one is
+ * passed, and otherwise falls back to the PORTAL_BASE_URL config key.
+ *
+ * @param {Object} [req] Express request, to derive the origin from.
+ * @return {{success: boolean, url?: string, message?: string}}
+ */
+function getInjectorUrl(req) {
+  const configured = config.get('PORTAL_BASE_URL');
+  let base = configured ? String(configured).replace(/\/+$/, '') : '';
+
+  if (!base && req && typeof req.get === 'function') {
+    const host = req.get('x-forwarded-host') || req.get('host');
+    const proto = req.get('x-forwarded-proto') || 'https';
+    if (host) base = proto + '://' + host;
+  }
+
+  if (!base) {
+    return {
+      success: false,
+      message: 'Cannot resolve the portal URL. Set PORTAL_BASE_URL, or call this ' +
+               'with the request so the origin can be derived from it.'
+    };
+  }
+  return { success: true, url: base + '/?page=injector' };
+}
+
+/**
+ * ============================================================================
+ * TRELLO PO CHECKLIST INJECTOR - SHIPPING REFERENCE # (freight/carrier ref)
+ * ============================================================================
+ * Stored as a single "Shipping Ref #: <value>" line in the card's description,
+ * not the checklist or a comment, so there is exactly one place to read/update
+ * it and it stays out of the line-item parsing regex. This is intentionally a
+ * standalone action, separate from line-item injection: unlike PO line items
+ * (known at order time), a freight/carrier reference number is usually only
+ * handed over weeks or months later, once the supplier actually ships -- often
+ * long after the original PO card was created. Formatted as a distinct labeled
+ * line so it can be regex-parsed later for a carrier-integration (e.g. RXO)
+ * lookup, the same way harvestFedExTrackingNumber() already harvests outbound
+ * FedEx tracking numbers out of card text.
+ * ============================================================================
+ */
+
+/**
+ * Reads the current Shipping Ref # (if any) off a card's description, to
+ * pre-fill the Injector's optional field when a card is selected.
+ *
+ * Parity with SRC/src/Service_Read.js:1666-1684.
+ *
+ * @param {string} cardId
+ * @return {Promise<{success: boolean, reference?: string, message?: string}>}
+ */
+async function getCardShippingReference(cardId) {
+  if (!cardId) return { success: false, message: 'No Card ID provided.' };
+  const creds = getTrelloInjectorCredentials();
+  if (!creds) return { success: false, message: 'Missing Trello credentials.' };
+
+  const url = `${TRELLO_INJECTOR_CONFIG.BASE_URL}/cards/${cardId}?fields=desc&key=${creds.key}&token=${creds.token}`;
+
+  try {
+    const res = await trelloFetch_(url, { method: 'get' }, { label: 'card description' });
+    if (!res.ok) {
+      return { success: false, message: 'Trello API Error: ' + res.getContentText() };
+    }
+    const desc = JSON.parse(res.text).desc || '';
+    const match = desc.match(/^Shipping Ref #:\s*(.+)$/mi);
+    return { success: true, reference: match ? match[1].trim() : '' };
+  } catch (e) {
+    return { success: false, message: 'Fetch Exception: ' + e.message };
+  }
+}
+
+/**
+ * Sets, updates, or clears (blank referenceNumber) the "Shipping Ref #:" line
+ * in a card's description, leaving the rest of the description intact.
+ *
+ * Parity with SRC/src/Service_Read.js:1690-1729, with one necessary change:
+ * SRC passes `payload: { desc: newDesc }`, which UrlFetchApp form-encodes.
+ * Node's fetch does not do that, so the body is sent as JSON with an explicit
+ * Content-Type -- which Trello accepts for PUT /1/cards/{id}. Sending the
+ * description as a query parameter instead was rejected on purpose: a long
+ * description would blow the URL length limit, and it would put free card text
+ * into a URL that ends up in logs.
+ *
+ * @param {string} cardId
+ * @param {string} referenceNumber blank to clear.
+ * @return {Promise<{success: boolean, reference?: string, message?: string}>}
+ */
+async function setCardShippingReference(cardId, referenceNumber) {
+  if (!cardId) return { success: false, message: 'No Card ID provided.' };
+  const creds = getTrelloInjectorCredentials();
+  if (!creds) return { success: false, message: 'Missing Trello credentials.' };
+
+  const getUrl = `${TRELLO_INJECTOR_CONFIG.BASE_URL}/cards/${cardId}?fields=desc&key=${creds.key}&token=${creds.token}`;
+
+  try {
+    const getRes = await trelloFetch_(getUrl, { method: 'get' }, { label: 'card description' });
+    if (!getRes.ok) {
+      return { success: false, message: 'Trello API Error: ' + getRes.getContentText() };
+    }
+    const currentDesc = JSON.parse(getRes.text).desc || '';
+    const cleanRef = String(referenceNumber || '').trim();
+
+    // Strip any existing "Shipping Ref #:" line (and trailing blank lines), then
+    // re-append the new value unless clearing, so there is always at most one
+    // such line.
+    const otherLines = currentDesc.split(/\r?\n/).filter(l => !/^Shipping Ref #:/i.test(l.trim()));
+    while (otherLines.length && otherLines[otherLines.length - 1].trim() === '') otherLines.pop();
+
+    let newDesc = otherLines.join('\n');
+    if (cleanRef) {
+      newDesc = newDesc ? newDesc + '\n\nShipping Ref #: ' + cleanRef : 'Shipping Ref #: ' + cleanRef;
+    }
+
+    const putUrl = `${TRELLO_INJECTOR_CONFIG.BASE_URL}/cards/${cardId}?key=${creds.key}&token=${creds.token}`;
+    const putRes = await trelloFetch_(putUrl, {
+      method: 'put',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ desc: newDesc })
+    }, { label: 'set shipping reference' });
+
+    if (putRes.ok) return { success: true, reference: cleanRef };
+    return { success: false, message: 'Trello API Error: ' + putRes.getContentText() };
+  } catch (e) {
+    return { success: false, message: 'Update Exception: ' + e.message };
+  }
+}
+
 module.exports = {
   getInboundPoBoardId_,
+  getSkuLastUpdatedMap,
+  buildSkuLastUpdatedMap_,
+  getTrelloBoardLabels,
+  getInboundPoBoardLabels,
+  getCardLabels,
+  updateCardLabels,
+  getInjectorUrl,
+  getCardShippingReference,
+  setCardShippingReference,
   getLogisticsDashboardData,
   warmLogisticsDashboardCache,
   getAllInventory,

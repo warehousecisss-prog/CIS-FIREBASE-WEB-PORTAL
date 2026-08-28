@@ -214,6 +214,14 @@ const SPEC = {
   SMTP_PORT: { default: '587', desc: 'port-only. SMTP port.' },
   SMTP_USER: { secret: true, desc: 'port-only. SMTP username.' },
   SMTP_PASS: { secret: true, desc: 'port-only. SMTP password.' },
+  PORTAL_BASE_URL: {
+    desc: 'port-only. Public origin the SPA is served from, e.g. ' +
+          '"https://cis-warehouse-portal.web.app". Used by ' +
+          'Service_Read.getInjectorUrl(), which in Apps Script could just ask ' +
+          'the runtime (ScriptApp.getService().getUrl()); Cloud Functions has no ' +
+          'equivalent. Optional -- when unset the origin is derived from the ' +
+          'incoming request instead.'
+  },
   SMTP_FROM: {
     default: 'Warehouse Portal <noreply@warehouse-portal.com>',
     desc: 'port-only. From header for outbound notifications.'
