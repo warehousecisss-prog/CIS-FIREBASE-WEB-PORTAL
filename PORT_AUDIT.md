@@ -4,11 +4,14 @@
 **Baseline commit:** `dd07a8f` (Antigravity's in-progress port, imported as-is)
 **Audited against:** original Apps Script repo at `SRC/src/` + `reference/SCHEMA.md` (v17)
 
-> **Status update 2026-08-28 — Phase 1 complete.** The infra spine and C1–C5
-> below are **fixed**; see `PHASE_1_NOTES.md` for what changed, the config keys
-> that now exist, and the auth decision. The "Missing functions by service",
-> "Not ported at all" and frontend sections are **unchanged and still accurate**
-> — Phase 2 has not started.
+> **Status update 2026-08-28 — Phases 1 and 2 complete.**
+> - **Phase 1** (`PHASE_1_NOTES.md`): infra spine, C1–C5, auth decision.
+> - **Phase 2** (`PHASE_2_NOTES.md`): `Shared_Classifiers` ported and wired in,
+>   `Service_Write` and `Service_Read` brought to parity.
+>
+> Sections below are annotated where they are now out of date. The **HTTP route
+> layer is the next bottleneck**: the service layer largely exists, but the SPA
+> cannot reach any of it.
 
 > Purpose: an honest map of what is actually ported, what is stubbed, and what
 > hasn't been started — so the remaining work can be sequenced. The existing
@@ -24,8 +27,8 @@
 |---|---|---|
 | Firebase scaffold | ~~**Usable**~~ **Fixed (Phase 1)** | `.firebaserc`, shared `firebase-admin` init, `config.js`, auth middleware, ESLint config all added. Node engine now `22`. |
 | `Service_SheetsAPI` (SS_API) | ~~**Blocking bug**~~ **Fixed (Phase 1)** | Writes use `RAW` + `INSERT_ROWS`. Real gid resolution via `getSheetId()`. `getSpreadsheetId()` reads `BATCH_SHEET_ID`. |
-| `Service_Read` | **~65%** | Dashboard + inventory reads ported. Trello label mgmt, shipping-reference r/w, SKU-last-updated map, board matrix all missing. |
-| `Service_Write` | **~45%** | AUDIT A1 silent-failure regression **fixed (Phase 1)**. Still 10 functions missing incl. `validateQty_`, `splitInventoryRow`, `moveHubGroup`, audit actions. |
+| `Service_Read` | ~~**~65%**~~ **~95% (Phase 2)** | Label management, shipping-reference r/w, SKU-last-updated map and the board matrix all ported. Only `testReadMPS` (a manual Logger harness) is absent. |
+| `Service_Write` | ~~**~45%**~~ **~95% (Phase 2)** | A1 silent-failure fixed; 9 of 10 missing functions ported (`validateQty_`, `splitInventoryRow`, `moveHubGroup`, audit actions, …). B5/B6/A3 fixed. Only `testReceivingDataFlow` (a manual Logger harness) is absent. |
 | `Service_Dates` | **~55%** | Forward ETA estimate ported. Reverse `estimateShipByDateV2` (SCHEMA §8 Engine 4), override detection, comment backfill, bot-account logic all missing. |
 | `Service_Conversions` | **~30%** | `planCaseConversion` shell ported; the case-breakdown / units-per-case engine (recent CHANGELOG work) is gone. |
 | `Service_Assembly` | **~60%** | build + explode ported; `explodePartialHub`, `commitInventoryMutation_`, `findEffectiveQtyPer_` missing. |
@@ -34,7 +37,7 @@
 | `Service_Validate` | **~85%** | Ported; board-id check against env still a comment. |
 | `Service_Diagnostics` / `Service_Email` | Ported / new | Email is a fresh nodemailer wrapper (no original). |
 | HTTP routes (`index.js`) | **~5%** | 2 GET routes + email trigger. Every mutation, Trello, FedEx, and dates call the SPA makes has no endpoint. |
-| Not ported at all | — | `Shared_Classifiers`, `Webhook_Receiver`, `syncAllBoardsToShipmentsTab`, `evaluateRollupStatuses`, `pushOutboundToShippingSchedule`, `Service_Router`, `Fedex_Master_Script`, HTS tools. |
+| Not ported at all | — | ~~`Shared_Classifiers`~~ **(ported, Phase 2)**, `Webhook_Receiver`, `syncAllBoardsToShipmentsTab`, `evaluateRollupStatuses`, `pushOutboundToShippingSchedule`, `Service_Router`, `Fedex_Master_Script`, HTS tools. |
 | Frontend views | **~10%** | Shell + 14 map SVGs converted. All views are placeholder/dummy-data. Client engine (`JS_Handlers` 337KB, `JS_Render_UI` 145KB) not ported. |
 
 ---
@@ -106,22 +109,27 @@ the `firebase` JS SDK).
 
 ## Missing functions by service
 
-### `Service_Write.js` (10 missing)
-`validateQty_` · `processAuditAction` · `bulkVerifyAuditLocations` ·
-`markAuditComplete` · `removeItemFromLocation` · `moveHubGroup` ·
-`splitInventoryRow` · `readLiveChecklistState_` · `logDisplayDiagnostic` ·
-`testReceivingDataFlow`
-→ `validateQty_` and `splitInventoryRow` are load-bearing (Adjust popup
-auto-split, SCHEMA v17 item 2). `moveHubGroup` is hub-group moves. Audit actions
-power the Wall-to-Wall Audit view.
+### `Service_Write.js` — **RESOLVED in Phase 2** (1 of 10 still missing)
+~~`validateQty_`~~ · ~~`processAuditAction`~~ · ~~`bulkVerifyAuditLocations`~~ ·
+~~`markAuditComplete`~~ · ~~`removeItemFromLocation`~~ · ~~`moveHubGroup`~~ ·
+~~`splitInventoryRow`~~ · ~~`readLiveChecklistState_`~~ ·
+~~`logDisplayDiagnostic`~~ · **`testReceivingDataFlow`** (still missing)
+→ `testReceivingDataFlow` is a manual `Logger.log` harness with no caller; a
+Node equivalent wants a different shape (returning data, not streaming to a
+log). Everything else is ported. See `PHASE_2_NOTES.md` §3.
 
-### `Service_Read.js` (~13 missing)
-`getSkuLastUpdatedMap` / `buildSkuLastUpdatedMap_` · `getInboundPoBoardId_` ·
-`getTrelloBoardLabels` · `getInboundPoBoardLabels` · `getCardLabels` ·
-`updateCardLabels` · `getInjectorUrl` · `getCardShippingReference` ·
-`setCardShippingReference` · `getBoardMatrix_` (referenced at `:555` as a TODO,
-never defined) · `testReadMPS`
-→ Label management + shipping-reference r/w are the TrelloInjector's backbone.
+### `Service_Read.js` — **RESOLVED in Phase 2** (1 still missing)
+~~`getSkuLastUpdatedMap` / `buildSkuLastUpdatedMap_`~~ · ~~`getInboundPoBoardId_`~~ ·
+~~`getTrelloBoardLabels`~~ · ~~`getInboundPoBoardLabels`~~ · ~~`getCardLabels`~~ ·
+~~`updateCardLabels`~~ · ~~`getInjectorUrl`~~ · ~~`getCardShippingReference`~~ ·
+~~`setCardShippingReference`~~ · ~~`getBoardMatrix_`~~ (now imported from
+`Shared_Classifiers`) · **`testReadMPS`** (still missing, same reason as
+`testReceivingDataFlow`)
+→ Three real bugs were found and fixed while porting these: a wrong
+`PORTAL_IGNORED_MARKER` literal that made the dashboard's ignore filter match
+nothing, a missing `productId` field on `getProductMap` entries that silently
+defeated the Inventory identity fix, and `getTrelloBoards` returning every board
+the token can see instead of the 4-board matrix. See `PHASE_2_NOTES.md` §4.
 
 ### `Service_Dates.js` (~16 missing)
 `estimateShipByDateV2` (reverse calc — SCHEMA §8 Engine 4, the batch ship-by
@@ -132,12 +140,17 @@ estimator) · `getDeliveryDestinationCatalog_` · `resolveTransitDestinationClus
 `findLatestReadyPortInfo_` · `getPeakSeasonWindow_` present · `setupShipmentDateColumns`
 → `estimateShippingWindowV2` also lost its `port` parameter in the port.
 
-### `Service_Conversions.js` (~6 missing)
-`getQbNameIndex_` · `resolveUnitsPerCase_` · `caseBreakdown_` ·
+### `Service_Conversions.js` (~5 missing — `getQbNameIndex_` done in Phase 2)
+~~`getQbNameIndex_`~~ (ported into `Shared_Classifiers` as `primeQbNameIndex` /
+`getQbNameIndex_`, split async/sync — see `PHASE_2_NOTES.md` §1) ·
+`resolveUnitsPerCase_` · `caseBreakdown_` ·
 `formatQtyWithCases_` · `setupCaseConversions` · `reportConversionGap`
 → These are the "show case counts alongside unit counts" feature (multiple
 recent CHANGELOG entries). Without them `planCaseConversion` can't actually
-break a quantity into cases.
+break a quantity into cases. **Also still regressed:** `findCaseConversion`
+prefix-matches the raw Inventory SKU, where SRC resolves it to the QB name
+first — the 2026-08-26 fix. Since receiving now writes the Product ID again,
+this matters less than it did, but it is not yet at parity.
 
 ### `Service_Assembly.js` (3 missing)
 `commitInventoryMutation_` (the shared atomic write helper) · `findEffectiveQtyPer_`
@@ -156,7 +169,7 @@ break a quantity into cases.
 
 | File | Size | Role | Port target |
 |---|---|---|---|
-| `Shared_Classifiers.js` | 44KB | Canonical name resolution, transit-mode & brand classification — shared client+server. Write/Read reference it in comments as "assume available". | `functions/services/` + duplicate needed client-side |
+| ~~`Shared_Classifiers.js`~~ | 44KB | **PORTED (Phase 2)** to `functions/services/Shared_Classifiers.js`, with a parity harness (`npm run test:parity`, 1492 comparisons). A client-side duplicate is still needed. |
 | `Webhook_Receiver.js` | 33KB | Real-time Trello card-update webhook | `onRequest` function |
 | `syncAllBoardsToShipmentsTab.js` | 35KB | Scheduled full board→SHIPMENTS pull | `onSchedule` (currently a no-op `scheduledSync`) |
 | `evaluateRollupStatuses.js` | 20KB | Rollup status state machine | service module, called by sync |
@@ -198,18 +211,27 @@ Still open:
 
 1. ~~**Config + infra spine**~~ — **DONE 2026-08-28** (`PHASE_1_NOTES.md`).
 2. ~~**Fix C1–C4 in `SS_API` + `Service_Write`**~~ — **DONE 2026-08-28**.
-3. **Port `Shared_Classifiers`** — Read/Write/Assembly all depend on it.
-   **← next**
-4. **Finish `Service_Write` + `Service_Read`** to function parity, checked
-   against SCHEMA §3/§15 column maps.
+3. ~~**Port `Shared_Classifiers`**~~ — **DONE 2026-08-28** (`PHASE_2_NOTES.md`).
+4. ~~**Finish `Service_Write` + `Service_Read`**~~ — **DONE 2026-08-28**.
 5. **Build the HTTP route layer** in `index.js` — one route per server call the
    SPA makes; route mutations through a common `runMutation` wrapper that
-   surfaces `{success:false}`.
+   surfaces `{success:false}`. **← next, and now the bottleneck:** the service
+   layer largely exists but nothing the SPA does can reach it.
 6. **`Service_Dates` parity** incl. `estimateShipByDateV2`.
 7. **Sync + webhook functions** (`syncAllBoardsToShipmentsTab`,
    `evaluateRollupStatuses`, `Webhook_Receiver`).
 8. **Frontend**: real data wiring, then views one at a time
    (Dashboard → FedEx → Maps → Injector → Limbo/Staged).
 
-Steps 1–2 are done. Step 3 is the remaining unblock; do it before trusting any
-"done" marker on the services above.
+Steps 1–4 are done. Step 5 is the next bottleneck.
+
+Two gaps span everything above and are worth deciding on before much more is
+built on the write path:
+
+- **No lock anywhere on the write path (AUDIT B7).** SRC wraps `modifySheetRow`,
+  the `*ByRow` twins and `splitInventoryRow` in `LockService.tryLock(10000)`.
+  Apps Script's `LockService` has no Node counterpart, so this needs a Firestore
+  transaction or a distributed lock — its own design decision. The row-mismatch
+  guard added in Phase 2 narrows the window but does not close it.
+- **`SS_API.commitAtomic` not ported (AUDIT B3).** Its only callers are the
+  assembly write paths, which are still unported.

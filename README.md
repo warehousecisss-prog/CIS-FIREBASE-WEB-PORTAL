@@ -9,6 +9,7 @@ React. **Port in progress** — see `PORT_AUDIT.md` for the honest state of it.
 |---|---|
 | [`PORT_AUDIT.md`](PORT_AUDIT.md) | Service-by-service map of what is actually ported, stubbed, or missing. Start here. |
 | [`PHASE_1_NOTES.md`](PHASE_1_NOTES.md) | What Phase 1 changed: the config spine, the C1–C5 regression fixes, and the auth decision. |
+| [`PHASE_2_NOTES.md`](PHASE_2_NOTES.md) | What Phase 2 changed: `Shared_Classifiers`, and `Service_Write` / `Service_Read` parity. |
 | [`reference/SCHEMA.md`](reference/SCHEMA.md) | The canonical operational contract (v17). **Source of truth** — if code contradicts it, the doc wins. |
 | [`reference/AUDIT_2026-08-24.md`](reference/AUDIT_2026-08-24.md) | Known critical bugs in the original, several of which regressed during the port. |
 | [`functions/README.md`](functions/README.md) | Backend orientation: layout, configuration, auth, the Sheets rules. |
