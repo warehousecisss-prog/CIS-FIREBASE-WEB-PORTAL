@@ -4,6 +4,12 @@
 **Baseline commit:** `dd07a8f` (Antigravity's in-progress port, imported as-is)
 **Audited against:** original Apps Script repo at `SRC/src/` + `reference/SCHEMA.md` (v17)
 
+> **Status update 2026-08-28 — Phase 1 complete.** The infra spine and C1–C5
+> below are **fixed**; see `PHASE_1_NOTES.md` for what changed, the config keys
+> that now exist, and the auth decision. The "Missing functions by service",
+> "Not ported at all" and frontend sections are **unchanged and still accurate**
+> — Phase 2 has not started.
+
 > Purpose: an honest map of what is actually ported, what is stubbed, and what
 > hasn't been started — so the remaining work can be sequenced. The existing
 > `MIGRATION_CHANGELOG.md` marks every backend service `[DONE]`; that is
@@ -16,10 +22,10 @@
 
 | Layer | State | Notes |
 |---|---|---|
-| Firebase scaffold | **Usable** | `firebase.json` hosting+functions OK. Missing `.firebaserc`, `firebase-admin` init, auth. Node engine pinned to EOL `18`. |
-| `Service_SheetsAPI` (SS_API) | **Blocking bug** | `USER_ENTERED` instead of `RAW` (re-introduces AUDIT B1). Hardcoded `sheetId: 0` for deletes. `getSpreadsheetId()` returns `"PLACEHOLDER_SHEET_ID"`. |
+| Firebase scaffold | ~~**Usable**~~ **Fixed (Phase 1)** | `.firebaserc`, shared `firebase-admin` init, `config.js`, auth middleware, ESLint config all added. Node engine now `22`. |
+| `Service_SheetsAPI` (SS_API) | ~~**Blocking bug**~~ **Fixed (Phase 1)** | Writes use `RAW` + `INSERT_ROWS`. Real gid resolution via `getSheetId()`. `getSpreadsheetId()` reads `BATCH_SHEET_ID`. |
 | `Service_Read` | **~65%** | Dashboard + inventory reads ported. Trello label mgmt, shipping-reference r/w, SKU-last-updated map, board matrix all missing. |
-| `Service_Write` | **~45%** | Core move/set/receive ported but with the AUDIT A1 silent-failure regression. 10 functions missing incl. `validateQty_`, `splitInventoryRow`, `moveHubGroup`, audit actions. |
+| `Service_Write` | **~45%** | AUDIT A1 silent-failure regression **fixed (Phase 1)**. Still 10 functions missing incl. `validateQty_`, `splitInventoryRow`, `moveHubGroup`, audit actions. |
 | `Service_Dates` | **~55%** | Forward ETA estimate ported. Reverse `estimateShipByDateV2` (SCHEMA §8 Engine 4), override detection, comment backfill, bot-account logic all missing. |
 | `Service_Conversions` | **~30%** | `planCaseConversion` shell ported; the case-breakdown / units-per-case engine (recent CHANGELOG work) is gone. |
 | `Service_Assembly` | **~60%** | build + explode ported; `explodePartialHub`, `commitInventoryMutation_`, `findEffectiveQtyPer_` missing. |
@@ -33,7 +39,10 @@
 
 ---
 
-## Critical regressions (fix before building on the port)
+## Critical regressions — ALL FIXED IN PHASE 1 (2026-08-28)
+
+> Kept below as the record of what was wrong and why it mattered. Each entry now
+> carries a **FIXED** line. Details in `PHASE_1_NOTES.md`.
 
 ### C1 — `SS_API` writes with `USER_ENTERED`, not `RAW`
 `functions/services/Service_SheetsAPI.js:50,84`. The original's `batchUpdateValues`
@@ -45,6 +54,9 @@ named `-3M SLIDE` or a comment `=2 pallets short` into a formula that renders
 fixed once upstream. Fix: `valueInputOption: "RAW"` in both `batchUpdateValues`
 and `batchAppendRows`.
 
+**FIXED 2026-08-28** — both use `RAW`; `batchAppendRows` also gained
+`insertDataOption: "INSERT_ROWS"` (AUDIT B2, same request object).
+
 ### C2 — Silent write-failure path re-introduced (AUDIT A1)
 `Service_Write.js:29` `modifySheetRow()` still does `if (targetRowIdx > -1) {...}`
 with no `else`, returning `undefined` when the row isn't found. Callers
@@ -55,11 +67,19 @@ repaints the old number. Fix: `modifySheetRow` returns
 `{success:false, error:'Row not found for <loc>/<sku>'}` on `-1`; callers return it
 verbatim. (Upstream `Service_Write.js` already has this — diff against it.)
 
+**FIXED 2026-08-28** — `modifySheetRow` returns a real result object on every
+path; all five callers return it verbatim. Callback is now awaited too. Still
+missing vs SRC: the `LockService` guard (B7) and `validateQty_` (B5) — Phase 2.
+
 ### C3 — `getSpreadsheetId()` returns a placeholder
 `Service_SheetsAPI.js:31`. Nothing reads/writes until `BATCH_SHEET_ID` is wired
 (env var / Firebase params). Same for every Trello/RXO/FedEx credential — the
 original pulls them from Script Properties; there is no equivalent config layer
 in the port yet.
+
+**FIXED 2026-08-28** — `functions/config.js` declares every key found by
+grepping SRC for `getProperty`, with defaults, aliases and source lines;
+`getSpreadsheetId()` is `config.require('BATCH_SHEET_ID')`.
 
 ### C4 — `batchDeleteRows` uses hardcoded `sheetId: 0`
 `Service_Write.js:101` passes `inventorySheetId = 0` with a comment admitting it's
@@ -67,10 +87,20 @@ a guess. Sheet gid 0 is the *first* tab, not necessarily `Inventory`. A wrong gi
 deletes rows from the wrong tab. Fix: resolve the real gid once via
 `spreadsheets.get` and cache it.
 
+**FIXED 2026-08-28** — `SS_API.getSheetId()` / `getSheetMetadata()` resolve and
+cache the real gid; all three hardcoded `0` call sites replaced;
+`batchDeleteRows` rejects a non-integer gid. Also supplies the
+`getSheetMetadata` that `Service_Assembly` already called but which never existed.
+
 ### C5 — Operator identity lost
 `getActiveUserEmail()` (duplicated in Write/Assembly/Diagnostics) returns the
 constant `"system@cis-portal.app"`. Every `Audit_Log` row and receiving payload
 loses who did it. Needs the real auth decision (below) before it means anything.
+
+**FIXED 2026-08-28** — Firebase Auth (Google provider), domain-locked, 401 on
+failure. One shared `getActiveUserEmail()` in `functions/auth.js` that throws
+rather than substituting a placeholder. Frontend sign-in still outstanding (needs
+the `firebase` JS SDK).
 
 ---
 
@@ -140,30 +170,36 @@ break a quantity into cases.
 
 ## Infra gaps
 
-- **No `.firebaserc`** — no project alias. `frontend/src/api.js:2` hardcodes
-  `cis-warehouse-portal` in the emulator URL.
-- **No `firebase-admin` init** anywhere; no `functions.config()` / params usage.
-- **No auth**. Original deploys `ANYONE_ANONYMOUS` but runs inside a Google login
-  (`Session.getActiveUser()` works). The port needs an explicit decision:
-  Firebase Auth (Google provider) + token verify middleware, or IAP, or accept
-  anonymous and drop operator attribution. This blocks C5.
-- **CORS** is `origin: true` (reflect any origin) — fine for dev, tighten for prod.
-- **Node `18`** in `functions/package.json` — EOL, Cloud Functions is pushing 20/22.
+Resolved in Phase 1:
+
+- ~~**No `.firebaserc`**~~ — added, alias `default` → `cis-warehouse-portal`.
+- ~~**No `firebase-admin` init**~~ — `functions/admin.js`, required once.
+- ~~**No auth**~~ — Firebase Auth (Google provider), domain-locked, 401.
+  See `PHASE_1_NOTES.md`.
+- ~~**Node `18`**~~ — now `22`.
+- **`npm run lint` was broken** (no ESLint config existed, yet `firebase.json`
+  runs it as a `predeploy` hook, so every deploy would have aborted) — fixed.
+
+Still open:
+
+- **CORS** is `origin: true` (reflect any origin). Acceptable now that every
+  route is bearer-token gated, but narrow it to the Hosting domain for prod.
+- **No frontend sign-in.** `frontend/src/api.js` sends no `Authorization`
+  header, so it 401s against a deployed backend. Needs the `firebase` JS SDK.
+- **Secrets are plain env vars**, not Secret Manager. Moving them is a
+  deploy-topology change — needs a decision.
 - **`scheduledSync`** is `logger.info("Scheduled sync running!")` and nothing else.
-- **`index.js` routes**: `/inventory`, `/logistics-dashboard` only. `api.js`
+- **`index.js` routes**: `/me`, `/inventory`, `/logistics-dashboard` only. `api.js`
   already calls `/shipment`, `/po-ingest`, `/diagnostics` → 404.
 
 ---
 
 ## Suggested sequencing
 
-1. **Config + infra spine** — `.firebaserc`, `firebase-admin` init, a
-   `config.js` that reads `BATCH_SHEET_ID` + all Trello/RXO/FedEx secrets from
-   env/params, fix `getSpreadsheetId`, resolve the real `Inventory` gid. Decide
-   auth. (Unblocks everything.)
-2. **Fix C1–C4 in `SS_API` + `Service_Write`** by diffing against upstream —
-   these are known-good fixes already written once.
+1. ~~**Config + infra spine**~~ — **DONE 2026-08-28** (`PHASE_1_NOTES.md`).
+2. ~~**Fix C1–C4 in `SS_API` + `Service_Write`**~~ — **DONE 2026-08-28**.
 3. **Port `Shared_Classifiers`** — Read/Write/Assembly all depend on it.
+   **← next**
 4. **Finish `Service_Write` + `Service_Read`** to function parity, checked
    against SCHEMA §3/§15 column maps.
 5. **Build the HTTP route layer** in `index.js` — one route per server call the
@@ -175,4 +211,5 @@ break a quantity into cases.
 8. **Frontend**: real data wiring, then views one at a time
    (Dashboard → FedEx → Maps → Injector → Limbo/Staged).
 
-Steps 1–3 are the unblock; do them before trusting any "done" marker.
+Steps 1–2 are done. Step 3 is the remaining unblock; do it before trusting any
+"done" marker on the services above.
