@@ -1,9 +1,10 @@
-# Phase 4 — the write-path lock, `Service_Dates` parity, and the move locks
+# Phase 4 — the write-path lock, Service_Dates + Service_Conversions parity, and the move locks
 
 **Date:** 2026-08-28
 **Baseline:** `371ac57` (end of Phase 3)
-**Scope:** three units. Unit A is the write-path lock (AUDIT B7). Unit B is
+**Scope:** four units. Unit A is the write-path lock (AUDIT B7). Unit B is
 `Service_Dates` parity. Unit C locks the three move paths SRC leaves open.
+Unit D is `Service_Conversions` parity, plus four aging-anchor bugs it uncovered.
 
 ---
 
@@ -714,3 +715,213 @@ the lease:
 a housekeeping sweep that deletes every row whose SKU is "Vacant", and it is
 unlocked in SRC too. It should probably take the lease as well — flagging rather
 than folding it in, since it was not part of what you approved.
+
+---
+
+# UNIT D — `Service_Conversions` parity, and four aging-anchor bugs it uncovered
+
+The unit was scoped as "port the five missing case-conversion functions". Half
+of it turned out to be that; the other half is what tracing one of those
+functions' dependencies exposed in code that was already marked done.
+
+## 1. `Service_Conversions` — what landed
+
+| Ported | What it is |
+|---|---|
+| `resolveUnitsPerCase_` | How many units are in one case of this product, or `null`. |
+| `FLOOR_CASE_SKUS_` | The four Burlington case SKUs, by hand — see below. |
+| `caseBreakdown_` | Splits a quantity into units + cases + remainder. |
+| `formatQtyWithCases_` | `"1,250 (25 cases)"` for plain-text surfaces. |
+| `setupCaseConversions` | One-off: creates and seeds the CASE_CONVERSIONS tab. |
+| `reportConversionGap` | How much buffer stock is convertible right now. |
+| `CASE_CONVERSIONS_HEADERS`, `clearCaseConversionsCache` | Supporting. |
+
+### `findCaseConversion` — the 2026-08-26 fix, restored
+
+This is the one that mattered. The port was prefix-matching the **raw Inventory
+SKU**. That worked only while Inventory held the full QuickBooks name — and
+since 2026-08-11 `receivePOCardItems()` writes the **nickname** there instead.
+
+A nickname does not start with the supplier code. Both `NT525S/2AMF` products
+are nicknamed *"2 Alarm SMALL Scorpion Tag"*, which shares **no prefix at all**
+with the rule keyed on `NT525S/2AMF`. So for everything received after that
+date, the put-away conversion simply never fired: no error, no log, units
+quietly stayed units.
+
+SRC resolves the SKU back to its QB name first, which makes the rule fire for
+either shape — legacy rows holding raw QB text, and new rows holding the
+nickname — without rewriting the conversion table or backfilling Inventory.
+Restored, and it is the thing the new parity harness is built around.
+
+### `FLOOR_CASE_SKUS_` is a hand-maintained list, deliberately
+
+`resolveUnitsPerCase_` has two sources: the CASE_CONVERSIONS sheet first, then
+this fixed list. SRC's comment explains why the list is not derived: it used to
+scrape `"(N per case)"` out of the QuickBooks name, and the 2026-08-28 name
+rewrite folded the full QB spec into every Inventory SKU string, so the scrape
+started firing on ADM adhesive packs (sold *as* the pack → rendered qty × 100)
+and Epson ERC ribbons (stored as individual ribbons → qty × 48). No string rule
+separates *"48 loose ribbons live in this box"* from *"the box of 48 IS the
+unit"*. It is a per-product fact, so it is listed by hand. Carried across as-is.
+
+> **Worth knowing:** the CASE_CONVERSIONS tab **does not exist in the live
+> workbook** — `setupCaseConversions()` was written in the original but never
+> run. So `getCaseConversions()` returns `[]` and the sheet-driven half of this
+> feature is dormant on both sides. `resolveUnitsPerCase_`'s second source is
+> what keeps the display helpers working meanwhile. Not a port defect; recorded
+> because "it's ported" and "it's doing anything" are different claims.
+
+## 2. Four aging-anchor bugs, found by following one dependency
+
+`resolveUnitsPerCase_` calls `namesMatch_`. Checking who else does led to
+`resolveOriginalArrivalDate` (`Service_Write.js`) and `buildAgingData_`
+(`Service_Read.js`) — **the only two places in the portal that decide how old
+the stock in a location is.** Everything the heatmap colours comes out of them.
+
+Both were wrong, in four separate ways, all silent:
+
+**(a) `EXPLODE_ASSEMBLY` is a string nothing ever writes.** Both functions
+listed it as a valid anchor action. Every explode path in `Service_Assembly.js`
+logs **`EXPLODE_RESTORE`** (`:183`, `:200`, `:209`) — which is what SRC lists.
+So every component row an explode returned to the floor had **no age anchor at
+all**, and its location read as unknown age on the heatmap forever.
+
+**(b) `SPLIT_IN` was missing from both lists.** `splitInventoryRow` mints a
+brand-new Inventory row, so a location holding only split-off rows had no anchor
+either. What makes this one notable: **this port already contains the comment
+saying it had to be added.** `splitInventoryRow`'s docblock was copied across
+verbatim, including the sentence *"the reason SPLIT_IN had to be added to
+buildAgingData_'s validActions and to resolveOriginalArrivalDate's own
+relevantActions"*. The comment was ported; the code was not.
+
+**(c) `resolveOriginalArrivalDate` used a two-way substring test** where SRC
+uses `namesMatch_`. SRC replaced it for a stated reason: a move's carried-forward
+arrival date is the item's dwell clock, and substring matching donates a
+**sibling's** date within the same product family — `T25-SCREW` matching
+`T25-SCREWDRIVER`.
+
+**(d) The carried-date branch checked `MOVE_IN` only** in both functions. So
+even once `SPLIT_IN` was recognised, a split-off row would have reset its dwell
+clock to the moment of the split instead of inheriting the lot's true arrival.
+
+SCHEMA invariant #69 is about precisely this class of failure — it records that
+an earlier version of the identity work would have shipped a 20-anchor
+regression invisibly, *"each affected location simply reading 'unknown age' on
+the heatmap for no reason a user could see."* All four fixed, and all four now
+pinned by an executed test rather than by prose.
+
+## 3. Nothing was priming the product-identity index
+
+`namesMatch_` consults `productIdentityKey_`, which reads the PRODUCT index.
+Phase 2 split SRC's synchronous sheet read into an async `primeQbNameIndex()`
+plus a sync cache read, and deliberately made an unprimed read warn once rather
+than fail — so a missing prime would be *findable*.
+
+It was never found, because **nothing in the codebase called
+`primeQbNameIndex()` at all.** The index was empty in every request, so every
+name comparison silently degraded to plain-key matching — which is the exact
+weakening invariant #69 exists to prevent, and it would have quietly undone
+fix (c) above.
+
+Now awaited at the two call sites that need it (`resolveOriginalArrivalDate`,
+and `findCaseConversion`/`resolveUnitsPerCase_`). It memoizes, so it costs one
+PRODUCT read per container.
+
+## 4. One place the port is deliberately BETTER than SRC
+
+While building the harness, SRC turned out to blank its entire aging map when
+Audit_Log contains a single unparseable timestamp:
+
+```js
+let parsedDate = ... new Date(Date.parse(rawTimestamp));
+if (parsedDate) {                                   // an Invalid Date is TRUTHY
+  const entry = { date: parsedDate.toISOString(), … };   // RangeError
+```
+
+`new Date('garbage').toISOString()` throws `RangeError: Invalid time value`,
+which escapes the `forEach` into `buildAgingData_`'s `catch (e) { return {}; }`.
+**One bad row anywhere in the log and every location on the heatmap reads
+"unknown age"**, with nothing surfaced anywhere.
+
+The port guards with `!isNaN(getTime())` and skips only the offending row. That
+was already true before this unit — it is not something I changed — but it is a
+real behavioural divergence, so it is now **asserted explicitly** in
+`parity_Aging.js` rather than quietly excluded from the corpus. If SRC is ever
+fixed upstream, that assertion fails and tells you to fold the row back in.
+
+**This is a live bug in the original**, worth fixing there independently of the
+port.
+
+## 5. Smaller notes
+
+- **`SS_API.batchUpdateSheet` gained its second caller.** `setupCaseConversions`
+  needs `addSheet` + a bold header + a frozen row, none of which
+  `spreadsheets.values.*` can do. Same primitive Unit B added for
+  `setupShipmentDateColumns`, and the one `commitAtomic` (AUDIT B3) will need.
+- **`reportConversionGap` returns data instead of streaming to `Logger.log`.**
+  Same deviation and same reasoning as the other manual-harness functions:
+  there is no Logger to read here.
+- **`formatQtyWithCases_` pins its thousands separators to `en-US`.** SRC leaves
+  it to the runtime locale. A Cloud Functions container's default is whatever
+  the image says, and this string is written into a Trello card a human reads —
+  `"1.250"` meaning one thousand two hundred and fifty is a genuinely dangerous
+  thing to render on a shipping document.
+- **No new routes.** None of these functions has a client call site in SRC.
+  `setupCaseConversions` creates a sheet and `reportConversionGap` is a manual
+  read; both are exported and neither is reachable over HTTP, deliberately.
+
+## 6. Verification
+
+Two new harnesses, both mutation-tested.
+
+### `npm run test:parity:conversions` — 7,401 comparisons across 7 functions
+
+The synthetic PRODUCT sheet is built around the failure this feature actually
+had: `NT525S/2AMF` nicknamed *"2 Alarm SMALL Scorpion Tag"*, sharing no prefix
+with its own conversion rule. The SKU corpus carries all three vocabularies the
+2026-08-11 and 2026-08-28 changes left behind — raw QB names, nicknames, floor
+case SKUs, the folded form, and the cap-truncated form.
+
+Bridges two structural differences: SRC defines `getQbNameIndex_` *inside*
+`Service_Conversions.js` and reads PRODUCT synchronously, where the port moved
+it to `Shared_Classifiers` and split it async; and SRC relies on Apps Script's
+single global namespace, reproduced by evaluating both files into one context.
+
+| Mutation | Result |
+|---|---|
+| QB-name resolution removed from `findCaseConversion` | **116 differences** — every nickname returning `null` where SRC finds the rule. The 2026-08-26 bug, exactly. |
+
+### `npm run test:parity:aging` — 198 comparisons + 1 verified divergence
+
+| Mutation | Result |
+|---|---|
+| `EXPLODE_RESTORE` → `EXPLODE_ASSEMBLY` | **3 differences** |
+| `SPLIT_IN` removed from both lists | **5 differences** |
+| `namesMatch_` → the two-way substring test | **29 differences** |
+| carried-date branch back to `MOVE_IN` only | **5 differences** |
+
+Restored and re-verified green after each.
+
+### Everything else
+
+| Check | Result |
+|---|---|
+| `npm run lint` | ✅ exit 0, the same 6 pre-existing warnings |
+| `npm run test:parity` (all four harnesses) | ✅ 1492 + 45850 + 7401 + 198 comparisons, 0 differences |
+| `npm run test:routes` | ✅ 82 checks, 0 failures |
+| `npm run test:lock` | ✅ 27 checks, 0 failures |
+| `firebase emulators:exec --only functions` | ✅ clean boot, exit 0, routes answer correctly |
+
+Total executed parity comparisons across the project: **54,941**.
+
+## 7. Still open after Unit D
+
+- **`Service_Assembly` parity** is now the largest remaining service gap:
+  `commitInventoryMutation_`, `findEffectiveQtyPer_`, `explodePartialHub`. It
+  lands together with `SS_API.commitAtomic` (AUDIT B3) or not at all —
+  `batchUpdateSheet` is now in place as the primitive.
+- **The sync/webhook functions** remain the largest body of unported code.
+- **`primeQbNameIndex` is called at two sites, not globally.** If a third caller
+  needs `namesMatch_`, it must await the prime too. A boot-time prime would be
+  tidier but would put a PRODUCT read on the cold-start path of every request,
+  including ones that never compare a name.

@@ -343,13 +343,36 @@ async function buildAgingData_() {
     const data = await SS_API.getSheetValues("Audit_Log!A:H");
     if (!data || data.length < 2) return {};
     const agingMap = {};
-    const validActions = ["STOW", "INITIAL_STOW", "PO_RECEIVED", "ADD", "MOVE_IN", "CONVERT_IN", "EXPLODE_ASSEMBLY"];
+    // Only ARRIVAL events are valid age anchors -- SET_TOTAL / REMOVE /
+    // MOVE_OUT / VERIFIED / CONVERT_OUT are excluded deliberately, because
+    // "how old is the stock here" is not "when did someone last touch it".
+    //
+    // TWO NAMES IN THIS LIST WERE WRONG IN THIS PORT (fixed 2026-08-28):
+    //
+    //  - "EXPLODE_ASSEMBLY" is a string NOTHING EVER WRITES. Every explode path
+    //    in Service_Assembly.js logs "EXPLODE_RESTORE" (:183, :200, :209), which
+    //    is also what SRC lists here. So every component row an explode returned
+    //    to the floor had no anchor at all and its location read as unknown age
+    //    on the heatmap.
+    //  - "SPLIT_IN" was missing entirely. splitInventoryRow mints a brand-new
+    //    Inventory row, so a location holding ONLY split-off rows had no anchor
+    //    either. Like MOVE_IN it carries the lot's TRUE arrival date in column
+    //    H, honoured by the branch below -- so it anchors the row without
+    //    resetting the dwell clock to the moment of the split.
+    //
+    // Matches SRC/src/Service_Read.js:622.
+    const validActions = ["STOW", "INITIAL_STOW", "PO_RECEIVED", "ADD", "MOVE_IN", "SPLIT_IN", "CONVERT_IN", "EXPLODE_RESTORE"];
     data.slice(1).forEach(row => {
       const rawTimestamp = row[0];
       const locId = row[1];
       const logSkuString = row[2] ? row[2].toString().toLowerCase().trim() : "";
       const action = row[3];
       const originalArrivalRaw = row[7];
+      // A blank SKU cell matches every SKU downstream (calculateInventoryAgeDays'
+      // two-way substring test: "".includes(x) and x.includes("") are both always
+      // true) -- skip these so a blank row can't act as a wildcard anchor for
+      // whatever SKU last happened to occupy the location. Confirmed live: ~0.8%
+      // of Audit_Log rows, concentrated in ADD (16%).
       if (logSkuString === "") return;
       if (locId && rawTimestamp && validActions.includes(action)) {
         let parsedDate = new Date(rawTimestamp);
@@ -357,7 +380,7 @@ async function buildAgingData_() {
           const key = locId.toUpperCase().trim();
           if (!agingMap[key]) agingMap[key] = [];
           const entry = { date: parsedDate.toISOString(), rawSku: logSkuString };
-          if (action === "MOVE_IN" && originalArrivalRaw) {
+          if ((action === "MOVE_IN" || action === "SPLIT_IN") && originalArrivalRaw) {
             const origParsed = new Date(originalArrivalRaw);
             if (origParsed && !isNaN(origParsed.getTime())) entry.originalDate = origParsed.toISOString();
           }
@@ -1213,6 +1236,10 @@ async function setCardShippingReference(cardId, referenceNumber) {
 }
 
 module.exports = {
+  // Exported for test/parity_Aging.js. The heatmap's age anchors are derived
+  // here and nowhere else, and two of the action names in its validActions list
+  // were wrong in this port -- so the derivation is worth pinning against SRC.
+  buildAgingData_,
   getInboundPoBoardId_,
   getSkuLastUpdatedMap,
   buildSkuLastUpdatedMap_,

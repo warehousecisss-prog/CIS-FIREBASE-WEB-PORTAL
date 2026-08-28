@@ -10,7 +10,9 @@ const {
   trelloFetch_,
   parseSysBlob_,
   resolveCanonicalProductId_,
-  splitProductIdFromDesc_
+  splitProductIdFromDesc_,
+  primeQbNameIndex,
+  namesMatch_
 } = require('./Shared_Classifiers');
 
 /**
@@ -331,24 +333,55 @@ async function resolveOriginalArrivalDate(locId, sku) {
   try {
     const data = await SS_API.getSheetValues("Audit_Log!A:H");
     if (!data) return null;
-    const relevantActions = ["STOW", "PO_RECEIVED", "ADD", "CONVERT_IN", "EXPLODE_ASSEMBLY", "MOVE_IN"];
+    // THREE THINGS IN THIS FUNCTION WERE WRONG IN THIS PORT (fixed 2026-08-28).
+    // All three had the same effect: a row that should have inherited its lot's
+    // true arrival date silently got none, so its location read as unknown age.
+    //
+    //  1. "EXPLODE_ASSEMBLY" is a string NOTHING EVER WRITES -- every explode
+    //     path logs "EXPLODE_RESTORE" (Service_Assembly.js:183,200,209).
+    //  2. "SPLIT_IN" was missing, even though splitInventoryRow's own comment
+    //     in this file says it had to be added here. The comment was ported;
+    //     the code was not. Included so a lot that was split, then moved, then
+    //     split again still resolves back to its ORIGINAL arrival rather than
+    //     to the most recent split -- the same multi-hop reasoning MOVE_IN is
+    //     here for.
+    //  3. The carried-date branch below checked MOVE_IN only, so even a
+    //     recognised SPLIT_IN row would have reset the dwell clock.
+    //
+    // Matches SRC/src/Service_Write.js:634.
+    const relevantActions = ["STOW", "PO_RECEIVED", "ADD", "CONVERT_IN", "EXPLODE_RESTORE", "MOVE_IN", "SPLIT_IN"];
     const cleanSku = String(sku || "").toLowerCase().trim();
-    let mostRecentMatch = null; 
+    let mostRecentMatch = null;
+
+    // namesMatch_ needs the PRODUCT index; the port splits SRC's synchronous
+    // read into an async prime plus a sync cache read (PHASE_2_NOTES.md §1).
+    // Unprimed, every comparison degrades to the plain canonical key -- which
+    // is exactly the 20-anchor aging regression SCHEMA invariant #69 exists to
+    // prevent. Memoized, so this costs one PRODUCT read per container.
+    await primeQbNameIndex();
 
     for (let i = 1; i < data.length; i++) {
       const rowLoc = data[i][1];
       const rowSku = data[i][2] ? data[i][2].toString().toLowerCase().trim() : "";
       const action = data[i][3];
       if (rowLoc !== locId || !relevantActions.includes(action)) continue;
+      // A blank rowSku would match everything below ("".includes(x) is false,
+      // but x.includes("") is always true) -- skip it so a blank-SKU log row
+      // can't donate its date to an unrelated SKU.
       if (rowSku === "") continue;
-      if (!(rowSku.includes(cleanSku) || cleanSku.includes(rowSku))) continue;
+      // namesMatch_ rather than the two-way substring test this port was using:
+      // a move's carried-forward arrival date is the item's dwell clock, and
+      // substring matching donated a sibling's date within the same product
+      // family (T25-SCREW vs T25-SCREWDRIVER). SRC replaced it for that reason;
+      // the port had kept the old form.
+      if (!namesMatch_(rowSku, cleanSku)) continue;
 
       const ts = new Date(Date.parse(data[i][0]));
       if (isNaN(ts.getTime())) continue;
 
       if (!mostRecentMatch || ts > mostRecentMatch.ts) {
         let originalDate = ts;
-        if (action === "MOVE_IN" && data[i][7]) {
+        if ((action === "MOVE_IN" || action === "SPLIT_IN") && data[i][7]) {
           const carried = new Date(Date.parse(data[i][7]));
           if (!isNaN(carried.getTime())) originalDate = carried;
         }

@@ -20,12 +20,20 @@
 >   functions including `estimateShipByDateV2`, and F4, which turned out to be
 >   THREE missing pieces rather than two. 45,850-comparison parity harness.
 >   `backfillIgnoreCommentsFromComments_` unblocked.
+> - **Phase 4, Unit C** (`PHASE_4_NOTES.md`): the three move paths locked —
+>   deliberately further than SRC goes.
+> - **Phase 4, Unit D** (`PHASE_4_NOTES.md`): `Service_Conversions` parity,
+>   including the 2026-08-26 QB-name fix. Tracing it uncovered **four
+>   aging-anchor bugs** in `Service_Read`/`Service_Write` and the fact that
+>   nothing was priming the product-identity index at all. Two more parity
+>   harnesses.
 >
 > Sections below are annotated where they are now out of date. The next
 > bottleneck is the **sync/webhook functions** (`syncAllBoardsToShipmentsTab`,
-> `evaluateRollupStatuses`, `Webhook_Receiver`) and **`Service_Conversions`
-> parity** — the routes exist, so what is missing is now visible as a 501 rather
-> than as a 404. Nine routes still answer 501.
+> `evaluateRollupStatuses`, `Webhook_Receiver`), and **`Service_Assembly`
+> parity** — which must land together with `SS_API.commitAtomic` — is the
+> largest remaining service-level gap. The routes exist, so what is missing is
+> now visible as a 501 rather than as a 404. Nine routes still answer 501.
 
 > Purpose: an honest map of what is actually ported, what is stubbed, and what
 > hasn't been started — so the remaining work can be sequenced. The existing
@@ -44,7 +52,7 @@
 | `Service_Read` | ~~**~65%**~~ **~95% (Phase 2)** | Label management, shipping-reference r/w, SKU-last-updated map and the board matrix all ported. Only `testReadMPS` (a manual Logger harness) is absent. **Phase 3 found three more gaps:** `findOrCreatePOCardAndInject` was creating Trello labels and had lost `idLabel` (fixed, F3); `getAllInventory` drops the Instance_ID column (F5) and returns `null` where SRC rethrows (F6, AUDIT A4). |
 | `Service_Write` | ~~**~45%**~~ **~95% (Phase 2)** | A1 silent-failure fixed; 9 of 10 missing functions ported (`validateQty_`, `splitInventoryRow`, `moveHubGroup`, audit actions, …). B5/B6/A3 fixed. Only `testReceivingDataFlow` (a manual Logger harness) is absent. **Phase 3 found two more gaps:** `moveInventoryItem` had lost `clientAssertsKnownCoordinate` (fixed, F1) and still listed `ZONE-STAGED` as a virtual zone (fixed, F2 — Phase 4). **Phase 4 also added the write lease and restored `receivePOCardItems`' missing re-check-under-lock.** |
 | `Service_Dates` | ~~**~55%**~~ **~98% (Phase 4B)** | `estimateShipByDateV2` (SCHEMA **§4G** — *not* §8 Engine 4, which is the FedEx CSV batch tool), override detection, comment backfill and bot-account logic all ported. F4 was three missing pieces, not two — the third, a lost exact-`Port`-first match in `findTransitLane_`, had reintroduced the 2026-08-21 port-collision bug on **every** ETA recompute. 45,850-comparison parity harness. |
-| `Service_Conversions` | **~30%** | `planCaseConversion` shell ported; the case-breakdown / units-per-case engine (recent CHANGELOG work) is gone. |
+| `Service_Conversions` | ~~**~30%**~~ **~100% (Phase 4D)** | Case-breakdown / units-per-case engine ported, and `findCaseConversion` restored to resolving the SKU to its QB name first — without that, the put-away conversion had stopped firing for everything received since 2026-08-11, silently. 7,401-comparison parity harness. Note the `CASE_CONVERSIONS` tab does not exist in the live workbook on either side. |
 | `Service_Assembly` | **~60%** | build + explode ported; `explodePartialHub`, `commitInventoryMutation_`, `findEffectiveQtyPer_` missing. |
 | `Service_PO_Ingest` | **~60%** | Parser ported; **`extractTextFromPdfBlob` (the actual pdf-parse call) missing**, supplier email missing. |
 | `Service_RXO` | **~80%** | Cleanest port. Missing config-status + diagnostics harness helpers. |
@@ -164,17 +172,39 @@ Destination dropdown; two Trello error strings rendered `undefined`; and
 → **Note:** `estimateShipByDateV2` is SCHEMA **§4G**. §8's Engine 4 is
 `batchCalculateTransitTimes()`, the FedEx CSV batch estimator, still a 501.
 
-### `Service_Conversions.js` (~5 missing — `getQbNameIndex_` done in Phase 2)
-~~`getQbNameIndex_`~~ (ported into `Shared_Classifiers` as `primeQbNameIndex` /
-`getQbNameIndex_`, split async/sync — see `PHASE_2_NOTES.md` §1) ·
-`resolveUnitsPerCase_` · `caseBreakdown_` ·
-`formatQtyWithCases_` · `setupCaseConversions` · `reportConversionGap`
-→ These are the "show case counts alongside unit counts" feature (multiple
-recent CHANGELOG entries). Without them `planCaseConversion` can't actually
-break a quantity into cases. **Also still regressed:** `findCaseConversion`
-prefix-matches the raw Inventory SKU, where SRC resolves it to the QB name
-first — the 2026-08-26 fix. Since receiving now writes the Product ID again,
-this matters less than it did, but it is not yet at parity.
+### `Service_Conversions.js` — **RESOLVED in Phase 4, Unit D**
+~~`getQbNameIndex_`~~ (in `Shared_Classifiers` as `primeQbNameIndex` /
+`getQbNameIndex_`, split async/sync — `PHASE_2_NOTES.md` §1) ·
+~~`resolveUnitsPerCase_`~~ · ~~`caseBreakdown_`~~ · ~~`formatQtyWithCases_`~~ ·
+~~`setupCaseConversions`~~ · ~~`reportConversionGap`~~ · ~~`FLOOR_CASE_SKUS_`~~
+→ `findCaseConversion` now resolves the SKU to its QB name before
+prefix-matching — the 2026-08-26 fix. This was **not** a cosmetic gap: since
+2026-08-11 receiving writes the *nickname* into Inventory, and a nickname shares
+no prefix with the supplier-code rule (both `NT525S/2AMF` products are nicknamed
+"2 Alarm SMALL Scorpion Tag"), so the put-away conversion had silently stopped
+firing for everything received after that date.
+→ The `CASE_CONVERSIONS` tab **does not exist in the live workbook** —
+`setupCaseConversions()` was written in the original but never run. The
+sheet-driven half is dormant on both sides; `resolveUnitsPerCase_`'s second
+source (`FLOOR_CASE_SKUS_`) is what keeps the display helpers working.
+
+### Aging anchors — **four bugs found and fixed in Phase 4, Unit D**
+
+Not previously listed here, because both functions were marked done.
+`buildAgingData_` (`Service_Read`) and `resolveOriginalArrivalDate`
+(`Service_Write`) are the only two places the portal decides how old the stock
+in a location is. Both listed **`EXPLODE_ASSEMBLY`**, a string nothing ever
+writes (every explode logs `EXPLODE_RESTORE`), both were missing **`SPLIT_IN`**,
+`resolveOriginalArrivalDate` used a two-way substring test where SRC uses
+`namesMatch_`, and both carried-date branches checked `MOVE_IN` only. Net effect:
+explode-restored and split-off rows had **no age anchor at all** and their
+locations read as unknown age on the heatmap forever. See `PHASE_4_NOTES.md`
+§Unit D/2 and the new `npm run test:parity:aging`.
+
+Separately: **nothing in the codebase was calling `primeQbNameIndex()`**, so the
+product-identity index was empty in every request and every name comparison had
+silently degraded to plain-key matching — the exact weakening SCHEMA invariant
+#69 exists to prevent. Now awaited at the sites that need it.
 
 ### `Service_Assembly.js` (3 missing)
 `commitInventoryMutation_` (the shared atomic write helper) · `findEffectiveQtyPer_`
@@ -259,9 +289,10 @@ Still open:
 8. **Frontend**: real data wiring, then views one at a time
    (Dashboard → FedEx → Maps → Injector → Limbo/Staged).
 
-Steps 1–6 are done. **Step 7 (sync + webhook functions) is the next
-bottleneck**, and `Service_Conversions` parity is the largest remaining
-service-level gap. Phase 4 also delivered the write-path lock, which never
+Steps 1–6 are done, and `Service_Conversions` parity landed with them
+(Phase 4, Unit D). **Step 7 (sync + webhook functions) is the next
+bottleneck**, and `Service_Assembly` parity — which must land together with
+`SS_API.commitAtomic` — is the largest remaining service-level gap. Phase 4 also delivered the write-path lock, which never
 appeared in this list because it was blocking nothing — and blocking-adjacent to
 everything.
 
