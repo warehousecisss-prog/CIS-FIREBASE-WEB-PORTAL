@@ -1,7 +1,13 @@
 const SS_API = require('./Service_SheetsAPI');
 const logger = require('firebase-functions/logger');
 const { getActiveUserEmail } = require('../auth');
-const { trelloCreds_, trelloFetch_, parseSysBlob_ } = require('./Shared_Classifiers');
+const {
+  trelloCreds_,
+  trelloFetch_,
+  parseSysBlob_,
+  resolveCanonicalProductId_,
+  splitProductIdFromDesc_
+} = require('./Shared_Classifiers');
 
 /**
  * ============================================================================
@@ -17,6 +23,36 @@ const INVENTORY_SHEET = "Inventory";
 // Generate UUID substitute for Utilities.getUuid()
 function getUuid() {
   return require('crypto').randomUUID();
+}
+
+/**
+ * Coerces a client-supplied quantity to a finite number, or reports why not.
+ *
+ * NaN is the specific hazard. Every qty write in this file branches on
+ * `newQty <= 0` to decide between "clear/delete the pallet" and "write the
+ * number" -- and `NaN <= 0` is FALSE, so a NaN silently falls through to the
+ * else and writes the literal value NaN into column C. The row then reads as
+ * blank/#VALUE and every downstream Number(...) on it produces NaN in turn.
+ *
+ * Reachable from the drawer with any non-numeric input ("12o", "abc", "1.2.3")
+ * because the client only does `Number(rawVal.replace(/,/g,''))` with no isNaN
+ * check. Guarded on both sides in SRC; this is the server half.
+ * See AUDIT_2026-08-24.md B5. Parity with SRC/src/Service_Write.js:26-36.
+ *
+ * @param {*} raw the incoming value.
+ * @param {string} label what to call it in the error message.
+ * @return {{ok: boolean, value?: number, error?: string}}
+ */
+function validateQty_(raw, label) {
+  const n = Number(raw);
+  if (!isFinite(n)) {
+    return {
+      ok: false,
+      error: (label || "Quantity") + " must be a number — got \"" +
+             String(raw === null || raw === undefined ? "" : raw) + "\"."
+    };
+  }
+  return { ok: true, value: n };
 }
 
 /**
@@ -36,12 +72,10 @@ function getUuid() {
  * from the caller anyway, and watched the UI repaint the old number. Matches
  * SRC/src/Service_Write.js:751-848.
  *
- * Not yet at parity with SRC (Phase 2, tracked in PHASE_1_NOTES.md):
- *  - no LockService equivalent around the read-compute-write (AUDIT B7). Apps
- *    Script's LockService has no Node counterpart; this needs a Firestore
- *    transaction or a distributed lock, which is its own design decision.
- *  - the _SYS_ blob parse below is still an inline try/catch rather than
- *    Shared_Classifiers' parseSysBlob_(), which is not ported yet (AUDIT A5).
+ * One remaining gap against SRC: there is no LockService equivalent around the
+ * read-compute-write (AUDIT B7). Apps Script's LockService has no Node
+ * counterpart; this needs a Firestore transaction or a distributed lock, which
+ * is its own design decision. Tracked in PHASE_1_NOTES.md.
  *
  * @param {string} locId
  * @param {string} sku
@@ -74,6 +108,29 @@ async function modifySheetRow(locId, sku, instanceOrRowId, callback, context) {
     }
   } else if (typeof instanceOrRowId === 'number' && instanceOrRowId > 1) {
     targetRowIdx = instanceOrRowId;
+
+    // A raw row index from the client is an assertion about the sheet, not a
+    // fact about it. SRC's *ByRow twins (updateInventoryByRow:846,
+    // setTotalStockByRow:896) re-read the row and refuse on a mismatch; in this
+    // port those twins delegate here, so the guard has to live here or it is
+    // lost. Without it, a row shifted by a concurrent sync between page load
+    // and tap means the write lands on a DIFFERENT pallet -- silently, and
+    // reported as success.
+    const snapshot = data[targetRowIdx - 1];
+    if (!snapshot) {
+      const err = 'Row ' + targetRowIdx + ' is past the end of Inventory. ' +
+                  'The sheet may have been modified.';
+      logger.warn('modifySheetRow: ' + err);
+      return { success: false, error: err };
+    }
+    if (targetLoc && targetSku &&
+        (cleanStr(snapshot[0]) !== targetLoc || cleanStr(snapshot[1]) !== targetSku)) {
+      const err = 'Row data mismatch. The sheet may have been modified.';
+      logger.warn('modifySheetRow: ' + err + ' (row ' + targetRowIdx + ' holds ' +
+                  cleanStr(snapshot[0]) + '/' + cleanStr(snapshot[1]) + ', expected ' +
+                  targetLoc + '/' + targetSku + ')');
+      return { success: false, error: err };
+    }
   }
   
   if (targetRowIdx === -1) {
@@ -147,8 +204,11 @@ async function modifySheetRow(locId, sku, instanceOrRowId, callback, context) {
 // `return {success:true}` that fired even when no row matched (AUDIT A1).
 // Parity with SRC/src/Service_Write.js:220-244.
 async function setTotalStock(locId, sku, newQty, instanceOrRowId, context) {
+  const qty = validateQty_(newQty, "New total");
+  if (!qty.ok) return { success: false, error: qty.error };
+  newQty = qty.value;
+
   return modifySheetRow(locId, sku, instanceOrRowId, async (sheet, rowIdx, itemsAtLoc) => {
-    newQty = Number(newQty);
     const userEmail = getActiveUserEmail(context);
     
     if (newQty <= 0) {
@@ -171,10 +231,14 @@ async function setTotalStock(locId, sku, newQty, instanceOrRowId, context) {
 
 // Same verbatim propagation as setTotalStock. Parity with SRC:246-271.
 async function updateStock(locId, sku, adjustment, instanceOrRowId, context) {
+  const adj = validateQty_(adjustment, "Adjustment");
+  if (!adj.ok) return { success: false, error: adj.error };
+  adjustment = adj.value;
+
   return modifySheetRow(locId, sku, instanceOrRowId, async (sheet, rowIdx, itemsAtLoc) => {
     const userEmail = getActiveUserEmail(context);
     const currentQty = Number(sheet.getRange(rowIdx, 3).getValue()) || 0;
-    let newQty = currentQty + Number(adjustment);
+    let newQty = currentQty + adjustment;
     
     if (newQty <= 0) {
       if (itemsAtLoc > 1) {
@@ -195,6 +259,12 @@ async function updateStock(locId, sku, adjustment, instanceOrRowId, context) {
 }
 
 async function addNewItemToLocation(locId, sku, initialQty, context) {
+  // Same NaN hazard as setTotalStock (B5) -- this one wrote the raw value
+  // straight to column C with no Number() at all, so "12o" landed as text.
+  const qty = validateQty_(initialQty, "Quantity");
+  if (!qty.ok) return { success: false, error: qty.error };
+  initialQty = qty.value;
+
   const data = await SS_API.getSheetValues("Inventory!A:G");
   
   let vacantIdx = data.findIndex(r => r[0] === locId && r[1] === "Vacant");
@@ -259,7 +329,12 @@ async function resolveOriginalArrivalDate(locId, sku) {
 
 async function moveInventoryItem(fromLoc, toLoc, sku, moveQty, isHubMove, instanceOrRowId, context) {
   const { planCaseConversion } = require('./Service_Conversions');
-  moveQty = Number(moveQty);
+  // NaN would survive every comparison below (`NaN > currentFromQty` is false,
+  // so the clamp never fires) and reach both the source and destination writes.
+  // See AUDIT_2026-08-24.md B5.
+  const qty = validateQty_(moveQty, "Move quantity");
+  if (!qty.ok) return { success: false, error: qty.error };
+  moveQty = qty.value;
   isHubMove = !!isHubMove;
   toLoc = String(toLoc || '').trim();
   if (!toLoc) return { success: false, error: "Destination location is required." };
@@ -597,6 +672,55 @@ async function setTotalStockByRow(rowIdx, locId, sku, newQty, context) {
 
 async function receivePOCardItems(cardId, cardName, itemsReceived, context) {
   try {
+    // ==================================================================
+    // TRUST BOUNDARY: replace the browser's oldQty/oldRcvd with what the
+    // Trello card actually says right now.
+    //
+    // Those two fields arrive FROM THE BROWSER, and the over-receipt guard
+    // below used to compute originalExpectedQty straight from them. Two
+    // stations with the same PO open therefore both held the same stale
+    // oldRcvd, both passed the guard, and both appended -- the guard could not
+    // see the other station at all. Worse, the stale numbers also fed the
+    // "| QTY: x | RCVD: y" string written back to Trello further down, so the
+    // losing station overwrote the winner's running total.
+    //
+    // Everything downstream of this block -- the guard, confirmedItems, the
+    // receipt email, and the checklist rewrite -- reads these corrected
+    // values. See AUDIT_2026-08-24.md B6 and SCHEMA invariant #53.
+    // ==================================================================
+    const liveById = await readLiveChecklistState_(cardId);
+    if (!liveById) {
+      return {
+        success: false,
+        error: 'Could not read this checklist from Trello to verify quantities. ' +
+               'Nothing was received -- please retry.'
+      };
+    }
+
+    itemsReceived.forEach(function(item) {
+      const live = item.idCheckItem ? liveById[item.idCheckItem] : null;
+      if (live) {
+        item.oldQty = live.qty;
+        item.oldRcvd = live.rcvd;
+      } else {
+        // No idCheckItem to verify against -- the "General Check-in" path,
+        // which has no checklist row on the card. Fall back to the payload,
+        // normalised. Nothing on Trello can confirm or deny these.
+        item.oldQty = Number(item.oldQty || 0);
+        item.oldRcvd = Number(item.oldRcvd || 0);
+      }
+      item.qty = Number(item.qty || 0);
+    });
+
+    // MIRRORS: JS_Handlers.html submitBulkPOReceipt()'s "Cannot over-receive!"
+    // check. That client check is NOT trusted as the only guard -- this rejects
+    // the whole batch atomically, before any Sheets/Trello writes, if any single
+    // item would push its total received above its expected quantity (oldQty +
+    // oldRcvd, i.e. remaining + already received, now both server-read per the
+    // block above). Items with no known expected quantity (both 0 -- e.g. a
+    // checklist item with an unparseable/missing qty per SCHEMA 4C) are
+    // intentionally not blocked, matching the client's same
+    // originalExpectedQty > 0 gate. Keep this in sync with the client check.
     for (let i = 0; i < itemsReceived.length; i++) {
       const item = itemsReceived[i];
       const originalExpectedQty = Number(item.oldQty || 0) + Number(item.oldRcvd || 0);
@@ -649,19 +773,17 @@ async function receivePOCardItems(cardId, cardName, itemsReceived, context) {
     
     htmlBody += '<ul style="list-style-type: none; padding: 0;">';
     
-    // Note: getProductMap is not implemented yet in this file, we assume it's imported or stubbed.
-    // Assuming resolveCanonicalItemName is available via Shared_Classifiers if we had them.
-    // We will do a generic replacement here.
+    // PRODUCT sheet, fetched once for this whole batch (not per item) and
+    // re-keyed uppercase for case-insensitive lookup -- see
+    // resolveCanonicalProductId_ in Shared_Classifiers.js. Used to write the
+    // canonical PRODUCT ID to Inventory instead of the raw
+    // "[ProductID] Description" checklist text. This replaces a pair of inline
+    // stubs that just pulled the bracket contents out, which is not the same
+    // thing: the bracket may hold a nickname, a typo, or the literal "[ITEM]".
+    const { getProductMap } = require('./Service_Read');
+    const productMap = (await getProductMap()) || {};
     const productMapUpper = {};
-    const resolveCanonicalItemName = (desc) => {
-      // Stub implementation: extract [SKU]
-      const match = desc.match(/^\[(.*?)\]/);
-      return match ? match[1].trim() : desc;
-    };
-    const splitProductIdFromDesc = (desc) => {
-      const match = desc.match(/^\[(.*?)\]\s*(.*)$/);
-      return match ? { productId: match[1].trim(), cleanDescription: match[2].trim() } : { productId: "", cleanDescription: desc };
-    };
+    Object.keys(productMap).forEach(k => { productMapUpper[k.toUpperCase()] = productMap[k]; });
 
     let trelloComments = [];
     let rowsToAppend = [];
@@ -670,12 +792,34 @@ async function receivePOCardItems(cardId, cardName, itemsReceived, context) {
     let now = new Date();
 
     itemsReceived.forEach(item => {
-      const inventoryName = resolveCanonicalItemName(item.desc);
+      // The Product ID, not the nickname. Between 2026-08-11 and 2026-08-26
+      // SRC wrote the nickname, which made a mutable display label the identity
+      // of a warehouse row: renaming a product orphaned its stock,
+      // findCaseConversion_ stopped firing (a nickname does not start with the
+      // supplier code), and every name comparison had to go fuzzy to cope. The
+      // nickname is still what staff SEE -- getNickname() resolves it at render
+      // time. See resolveCanonicalProductId_ in Shared_Classifiers.js.
+      const inventoryName = resolveCanonicalProductId_(item.desc, productMapUpper);
       const instanceId = getUuid();
-      rowsToAppend.push(['ZONE-BUFFER', inventoryName, item.qty, 'PO_RECEIVED', now.toISOString(), 'RCVD from ' + cardName, instanceId]);
 
-      let userEmail = getActiveUserEmail(context);
-      if (item.stationId) userEmail += ' [' + item.stationId + ']';
+      // Column D (status) is "Open", same as any other stock -- nobody works
+      // the sheet to flip this by hand, so a special received-only status just
+      // meant freshly-received Limbo stock silently read as "staged" to any
+      // code checking status !== "Open" (generateLocalTotals()). Column E
+      // (softKitTag) must stay "None" -- it is a kit/bulk-hub type flag the
+      // assembly logic reads, not a timestamp. The receipt trail lives in the
+      // comment column (F); Audit_Log still gets its own PO_RECEIVED entry
+      // below, and that one must stay -- it is the aging anchor getAgingData()
+      // needs. This port had written 'PO_RECEIVED' into D and a timestamp into
+      // E, corrupting both.
+      const receivedNote = 'RCVD from ' + cardName + ' on ' + now.toISOString();
+      rowsToAppend.push(['ZONE-BUFFER', inventoryName, item.qty, 'Open', 'None', receivedNote, instanceId]);
+
+      // stationId tagging removed upstream 2026-08-27.
+      const userEmail = getActiveUserEmail(context);
+      // Audit_Log sku must match what was actually written to Inventory above
+      // (inventoryName), not the raw checklist text -- getAgingData()'s fuzzy
+      // match depends on these staying in sync.
       logRowsToAppend.push([now.toISOString(), 'ZONE-BUFFER', inventoryName, 'PO_RECEIVED', 0, item.qty, userEmail]);
 
       confirmedItems.push({
@@ -685,7 +829,7 @@ async function receivePOCardItems(cardId, cardName, itemsReceived, context) {
         newRcvd: item.oldRcvd + item.qty
       });
 
-      const parsed = splitProductIdFromDesc(item.desc);
+      const parsed = splitProductIdFromDesc_(item.desc);
       let displayDesc = parsed.cleanDescription;
       let extraInfo = parsed.productId;
 
@@ -711,6 +855,26 @@ async function receivePOCardItems(cardId, cardName, itemsReceived, context) {
     // Post to Trello through the shared rate-limited transport.
     const { key: apiKey, token: apiToken } = trelloCreds_();
     
+    // ==================================================================
+    // The inventory rows are already committed above. Everything below is the
+    // Trello half, and its outcome is REPORTED rather than swallowed.
+    //
+    // These calls used to run with the response code never inspected and an
+    // empty catch around each one, then the function returned {success:true}
+    // regardless. Failure scenario: the Trello token expires or Trello answers
+    // 429 mid-batch. Inventory gains the units, the Trello checklist still
+    // shows the full remaining QTY, the operator sees a success toast, and the
+    // next shift receives the same PO again -- inventory double-counts with no
+    // error anywhere. See AUDIT_2026-08-24.md A3.
+    //
+    // The result carries trelloSynced:false and failedItems[] so the client can
+    // show a distinct warning state. Deliberately NOT a hard failure: the stock
+    // is physically on the floor and the Inventory write already succeeded, so
+    // refusing the whole operation would be a lie in the other direction. The
+    // operator needs to know to fix the card by hand.
+    // ==================================================================
+    const failedItems = [];
+
     if (apiKey && apiToken) {
       await Promise.all(itemsReceived.map(async (item) => {
         if (item.idCheckItem) {
@@ -718,30 +882,46 @@ async function receivePOCardItems(cardId, cardName, itemsReceived, context) {
           const newQty = Math.max(0, item.oldQty - item.qty);
           const newName = `${item.desc} | QTY: ${newQty} | RCVD: ${newRcvd}`;
           const state = newQty === 0 ? 'complete' : 'incomplete';
-          
+
           const url = `https://api.trello.com/1/cards/${cardId}/checkItem/${item.idCheckItem}?key=${apiKey}&token=${apiToken}`;
-          try {
-            await trelloFetch_(url, {
-              method: 'put',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ name: newName, state: state })
+          const res = await trelloFetch_(url, {
+            method: 'put',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: newName, state: state })
+          }, { label: 'checklist update' });
+          if (!res.ok) {
+            failedItems.push({ desc: item.desc, qty: item.qty, reason: res.error || ('HTTP ' + res.code) });
+            logger.error('receivePOCardItems: checklist update failed', {
+              cardId: cardId, desc: item.desc, code: res.code
             });
-          } catch(e) {}
+          }
         }
       }));
 
       await Promise.all(trelloComments.map(async (comment) => {
         const url = `https://api.trello.com/1/cards/${cardId}/actions/comments?key=${apiKey}&token=${apiToken}`;
-        try {
-          await trelloFetch_(url, {
-            method: 'post',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text: comment })
+        const res = await trelloFetch_(url, {
+          method: 'post',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: comment })
+        }, { label: 'receipt comment' });
+        if (!res.ok) {
+          failedItems.push({ desc: comment, reason: res.error || ('HTTP ' + res.code) });
+          logger.error('receivePOCardItems: receipt comment failed', {
+            cardId: cardId, code: res.code
           });
-        } catch(e) {}
+        }
       }));
+    } else {
+      failedItems.push({
+        desc: 'all items',
+        reason: 'Trello credentials are not configured (TRELLO_KEY / TRELLO_TOKEN).'
+      });
+      logger.error('receivePOCardItems: no Trello credentials -- inventory was written ' +
+                   'but the card was not updated', { cardId: cardId });
     }
-    
+
+
     const receivedAny = itemsReceived.some(item => item.qty > 0);
     const stillPending = !isPoFullyReceived;
     const isPartial = receivedAny && stillPending;
@@ -781,6 +961,11 @@ async function receivePOCardItems(cardId, cardName, itemsReceived, context) {
 
     return {
       success: true,
+      // false means the Inventory write landed but Trello did not fully catch
+      // up -- the card still shows stale quantities and needs a manual fix.
+      // The client must render this as a warning, not a plain success (A3).
+      trelloSynced: failedItems.length === 0,
+      failedItems: failedItems,
       confirmedItems: confirmedItems,
       isPoFullyReceived: isPoFullyReceived,
       poTotalRcvd: poTotalRcvd,
@@ -899,8 +1084,557 @@ async function processPackedOutboundCard(cardId) {
   return { success: true };
 }
 
+/**
+ * ============================================================================
+ * AUDIT ACTIONS (Wall-to-Wall / QB Audit views)
+ * ============================================================================
+ */
+
+/**
+ * One audit row's outcome. A blank/absent qty means "counted, matches" and
+ * stamps a VERIFIED row; a number means "counted, differs" and re-uses the
+ * ordinary set-total path so the correction is written and logged like any
+ * other.
+ *
+ * Parity with SRC/src/Service_Write.js:38-46.
+ *
+ * @param {string} locId
+ * @param {string} sku
+ * @param {*} newQty blank/null to verify only.
+ * @param {Object} [context]
+ * @return {Promise<{success: boolean, error?: string}>}
+ */
+async function processAuditAction(locId, sku, newQty, context) {
+  try {
+    if (newQty === null || newQty === "" || newQty === undefined) {
+      const userEmail = getActiveUserEmail(context);
+      await SS_API.batchAppendRows("Audit_Log",
+          [[new Date().toISOString(), locId, sku, "VERIFIED", 0, 0, userEmail]]);
+      return { success: true };
+    }
+    return await setTotalStock(locId, sku, newQty, null, context);
+  } catch (e) {
+    logger.error('processAuditAction failed for ' + locId + '/' + sku, { error: e.message });
+    return { success: false, error: e.toString() };
+  }
+}
+
+/**
+ * Bulk counterpart to processAuditAction()'s no-qty branch -- lets the QB Audit
+ * page's "Verify All" button stamp every remaining queued location as VERIFIED
+ * in one round trip instead of requiring an individual VERIFY click per row.
+ *
+ * Exists because "last touched" (getSkuLastUpdatedMap(), every action type) and
+ * "age" (buildAgingData_(), arrival events only) are deliberately separate
+ * signals -- a SKU that hasn't physically moved still needs a way to refresh
+ * "last touched" when a floor walk confirms it's still accurate, without that
+ * walk also resetting its age/heatmap anchor. VERIFIED is excluded from
+ * buildAgingData_()'s validActions, so this bulk write is safe for that reason
+ * alone.
+ *
+ * Parity with SRC/src/Service_Write.js:67-92.
+ *
+ * @param {Array<{sku: string, locId: string, originalSku: string}>} pairs
+ *     sku/locId identify the Audit_Log row to write (matchedSku when the QB
+ *     sheet's text differs from the live Inventory sku); originalSku is the
+ *     literal QB_Audits sheet value, used to resolve which sheet row(s) to
+ *     flag DONE.
+ * @param {Object} [context]
+ * @return {Promise<{success: boolean, verified?: number, error?: string}>}
+ */
+async function bulkVerifyAuditLocations(pairs, context) {
+  try {
+    if (!pairs || !pairs.length) return { success: true, verified: 0 };
+
+    const userEmail = getActiveUserEmail(context);
+    const now = new Date().toISOString();
+    const rows = pairs.map(p => [now, p.locId, p.sku, "VERIFIED", 0, 0, userEmail]);
+    await SS_API.batchAppendRows("Audit_Log", rows);
+
+    const distinctSkus = [...new Set(pairs.map(
+        p => (p.originalSku || p.sku).toString().toUpperCase().trim()))];
+    const data = await SS_API.getSheetValues("QB_Audits!A:B");
+    const updates = [];
+    for (let i = 1; i < (data || []).length; i++) {
+      const cell = data[i][0] ? data[i][0].toString().toUpperCase().trim() : "";
+      if (distinctSkus.includes(cell)) {
+        updates.push({ range: `QB_Audits!B${i + 1}`, values: [["DONE"]] });
+      }
+    }
+    if (updates.length > 0) await SS_API.batchUpdateValues(updates);
+
+    return { success: true, verified: rows.length };
+  } catch (e) {
+    logger.error('bulkVerifyAuditLocations failed', { error: e.message });
+    return { success: false, error: e.message };
+  }
+}
+
+/**
+ * Flags every QB_Audits row for a SKU as DONE.
+ * Parity with SRC/src/Service_Write.js:94-106.
+ *
+ * @param {string} targetSku
+ * @return {Promise<{success: boolean, error?: string}>}
+ */
+async function markAuditComplete(targetSku) {
+  try {
+    const data = await SS_API.getSheetValues("QB_Audits!A:B");
+    if (!data || data.length < 2) return { success: false, error: "QB_Audits sheet is empty." };
+    const cleanTarget = String(targetSku || "").toUpperCase().trim();
+    const updates = [];
+    for (let i = 1; i < data.length; i++) {
+      if (data[i][0] && data[i][0].toString().toUpperCase().trim() === cleanTarget) {
+        updates.push({ range: `QB_Audits!B${i + 1}`, values: [["DONE"]] });
+      }
+    }
+    if (updates.length > 0) await SS_API.batchUpdateValues(updates);
+    return { success: true };
+  } catch (e) {
+    logger.error('markAuditComplete failed for ' + targetSku, { error: e.message });
+    return { success: false, error: e.toString() };
+  }
+}
+
+/**
+ * Hard-deletes an item from a location, cascading into the Master Hub pieces a
+ * Frame row owns.
+ *
+ * The cascade is the reason this is not just a setTotalStock(0): a Frame row
+ * (_SYS_ t:"F") carries a map of which components were pulled to which buffer
+ * locations. Deleting the frame without releasing those leaves orphaned "B"
+ * rows belonging to a build that no longer exists -- stock that is invisible to
+ * the floor and uncorrectable from the UI.
+ *
+ * Parity with SRC/src/Service_Write.js:108-210.
+ *
+ * @param {string} locId
+ * @param {string} sku
+ * @param {string|number} instanceOrRowId
+ * @param {Object} [context]
+ * @return {Promise<{success: boolean, error?: string}>}
+ */
+async function removeItemFromLocation(locId, sku, instanceOrRowId, context) {
+  try {
+    const data = await SS_API.getSheetValues("Inventory!A:G");
+
+    let targetRowIdx = -1;
+    let sysData = null;
+    let itemsAtLoc = 0;
+
+    for (let i = 1; i < data.length; i++) {
+      if (data[i][0] === locId && data[i][1] !== "Vacant") itemsAtLoc++;
+    }
+
+    if (typeof instanceOrRowId === 'string' && instanceOrRowId.length > 10) {
+      for (let i = 1; i < data.length; i++) {
+        if (data[i][6] === instanceOrRowId) {
+          targetRowIdx = i + 1;
+          sysData = parseSysBlob_(data[i][5], 'Inventory row ' + (i + 1)) || sysData;
+          break;
+        }
+      }
+    } else if (typeof instanceOrRowId === 'number' && instanceOrRowId > 1) {
+      targetRowIdx = instanceOrRowId;
+      const snapshot = data[targetRowIdx - 1];
+      if (snapshot) sysData = parseSysBlob_(snapshot[5], 'Inventory row ' + targetRowIdx) || sysData;
+    }
+
+    if (targetRowIdx === -1) {
+      for (let i = 1; i < data.length; i++) {
+        if (data[i][0] === locId && data[i][1] === sku) {
+          targetRowIdx = i + 1;
+          sysData = parseSysBlob_(data[i][5], 'Inventory row ' + (i + 1)) || sysData;
+        }
+      }
+    }
+
+    // Returns a real result rather than silently doing nothing -- deleteItem()
+    // in the client only ever registered a success handler, so a no-op here
+    // used to leave the optimistic "location is now vacant" UI standing.
+    if (targetRowIdx === -1) {
+      return {
+        success: false,
+        error: 'Row not found for ' + locId + '/' + sku +
+               '. The pallet may have been moved or deleted by another station.'
+      };
+    }
+
+    let rowsToDelete = [];
+    let sheetUpdates = [];
+    if (itemsAtLoc > 1) {
+      rowsToDelete.push(targetRowIdx);
+    } else {
+      sheetUpdates.push({
+        range: `Inventory!B${targetRowIdx}:F${targetRowIdx}`,
+        values: [["Vacant", 0, "Open", "None", ""]]
+      });
+    }
+
+    const userEmail = getActiveUserEmail(context);
+    await SS_API.batchAppendRows("Audit_Log",
+        [[new Date().toISOString(), locId, sku, "HARD_DELETE", 0, 0, userEmail]]);
+
+    // --- CASCADE BULK DELETION ---
+    if (sysData && sysData.t === 'F' && sysData.b) {
+      let bulkRowsToDelete = [];
+      let bulkRowsToVacant = [];
+      for (let comp in sysData.b) {
+        for (let bLoc in sysData.b[comp]) {
+          let targetQty = sysData.b[comp][bLoc];
+          let itemsAtBLoc = data.filter(r => r[0] === bLoc && r[1] !== "Vacant").length;
+          for (let j = 1; j < data.length; j++) {
+            if (data[j][0] === bLoc && data[j][1] === sku) {
+              const bSys = parseSysBlob_(data[j][5], 'Inventory row ' + (j + 1));
+              if (bSys && bSys.t === 'B' && bSys.p === comp && bSys.f && bSys.f[locId] === targetQty) {
+                if (itemsAtBLoc > 1) {
+                  if (!bulkRowsToDelete.includes(j + 1)) bulkRowsToDelete.push(j + 1);
+                } else {
+                  if (!bulkRowsToVacant.includes(j + 1)) bulkRowsToVacant.push(j + 1);
+                }
+                break;
+              }
+            }
+          }
+        }
+      }
+
+      bulkRowsToVacant.forEach(r => {
+        sheetUpdates.push({
+          range: `Inventory!B${r}:F${r}`,
+          values: [["Vacant", 0, "Open", "None", ""]]
+        });
+      });
+
+      let finalDeletions = [...rowsToDelete, ...bulkRowsToDelete];
+      finalDeletions = [...new Set(finalDeletions)].sort((a, b) => b - a);
+
+      if (sheetUpdates.length > 0) await SS_API.batchUpdateValues(sheetUpdates);
+      if (finalDeletions.length > 0) {
+        await SS_API.batchDeleteRows(await SS_API.getSheetId(INVENTORY_SHEET), finalDeletions);
+      }
+    } else {
+      if (sheetUpdates.length > 0) await SS_API.batchUpdateValues(sheetUpdates);
+      if (rowsToDelete.length > 0) {
+        await SS_API.batchDeleteRows(await SS_API.getSheetId(INVENTORY_SHEET), rowsToDelete);
+      }
+    }
+
+    return { success: true };
+  } catch (e) {
+    // Unguarded in SRC too until recently -- deleteItem() only ever registered a
+    // success handler, so a thrown exception here (locked sheet, stale row after
+    // a concurrent edit) used to vanish silently.
+    logger.error('removeItemFromLocation failed for ' + locId + '/' + sku, { error: e.message });
+    return { success: false, error: e.toString() };
+  }
+}
+
+/**
+ * Moves a whole Master Hub group -- several Inventory rows sharing one build --
+ * to a new location in one operation, preserving each row's instanceId, status,
+ * soft-kit tag and _SYS_ blob.
+ *
+ * Parity with SRC/src/Service_Write.js:524-612.
+ *
+ * @param {string} fromLoc
+ * @param {string} toLoc
+ * @param {Array<string>} instanceIds
+ * @param {boolean} clientAssertsKnownCoordinate operator confirmed a real but
+ *     never-stowed-to floor coordinate.
+ * @param {Object} [context]
+ * @return {Promise<{success: boolean, moved?: number, error?: string}>}
+ */
+async function moveHubGroup(fromLoc, toLoc, instanceIds, clientAssertsKnownCoordinate, context) {
+  try {
+    const data = await SS_API.getSheetValues("Inventory!A:G");
+
+    if (!Array.isArray(instanceIds) || instanceIds.length === 0) {
+      return { success: false, error: "Nothing selected to move." };
+    }
+
+    toLoc = String(toLoc || '').trim();
+    if (!toLoc) return { success: false, error: "Destination location is required." };
+
+    // ZONE-STAGED removed 2026-08-27 -- staging is a status (column D), not a
+    // destination; no client-side path can send a move here anymore, and the
+    // server should reject one just as it would any other unrecognized
+    // destination now, rather than silently accepting it as always-vacant.
+    const VIRTUAL_ZONES = ['ZONE-BUFFER'];
+    const toLocUpper = toLoc.toUpperCase();
+    if (!VIRTUAL_ZONES.includes(toLocUpper)) {
+      let knownLocation = null;
+      for (let i = 1; i < data.length; i++) {
+        if (String(data[i][0] || '').toUpperCase() === toLocUpper) { knownLocation = data[i][0]; break; }
+      }
+      if (knownLocation !== null) {
+        toLoc = knownLocation;
+      } else if (!clientAssertsKnownCoordinate) {
+        return {
+          success: false,
+          error: "Unknown destination '" + toLoc + "' -- it doesn't match any existing " +
+                 "location or recognized zone. Move rejected rather than creating a new one."
+        };
+      }
+      // else: a real, never-stowed-to floor coordinate -- see
+      // moveInventoryItem()'s matching comment.
+    }
+    if (String(toLoc).toUpperCase() === String(fromLoc).toUpperCase()) {
+      return { success: false, error: "Destination is the same as the source." };
+    }
+
+    const userEmail = getActiveUserEmail(context);
+    let updates = [];
+    let rowsToDelete = [];
+    let newRows = [];
+    let logEntries = [];
+    let movedCount = 0;
+
+    instanceIds.forEach(instId => {
+      for (let i = 1; i < data.length; i++) {
+        if (data[i][6] !== instId) continue;
+        const qty = Number(data[i][2]);
+        if (qty <= 0) break;
+        const sku = data[i][1];
+        const resTag = data[i][3] || "Open";
+        const softKitTag = data[i][4] || "None";
+        const comTag = data[i][5] || "";
+
+        const itemsAtFromLoc = data.filter(r => r[0] === fromLoc && r[1] !== "Vacant").length;
+        if (itemsAtFromLoc - rowsToDelete.length > 1) {
+          rowsToDelete.push(i + 1);
+        } else {
+          updates.push([i + 1, 2, "Vacant"], [i + 1, 3, 0], [i + 1, 4, "Open"],
+                       [i + 1, 5, "None"], [i + 1, 6, ""]);
+        }
+
+        newRows.push([toLoc, sku, qty, resTag, softKitTag, comTag, instId]);
+        logEntries.push([new Date().toISOString(), fromLoc, sku, "MOVE_OUT", qty, 0, userEmail]);
+        logEntries.push([new Date().toISOString(), toLoc, sku, "MOVE_IN", qty, "", userEmail]);
+        movedCount++;
+        break;
+      }
+    });
+
+    if (movedCount === 0) {
+      return {
+        success: false,
+        error: "None of this pallet's rows were found at " + fromLoc + " -- it may have already moved."
+      };
+    }
+
+    const sheetUpdates = updates.map(upd => {
+      const colLetter = String.fromCharCode(64 + upd[1]);
+      return { range: `Inventory!${colLetter}${upd[0]}`, values: [[upd[2]]] };
+    });
+    if (sheetUpdates.length > 0) await SS_API.batchUpdateValues(sheetUpdates);
+    if (rowsToDelete.length > 0) {
+      await SS_API.batchDeleteRows(await SS_API.getSheetId(INVENTORY_SHEET), rowsToDelete);
+    }
+    if (newRows.length > 0) await SS_API.batchAppendRows("Inventory", newRows);
+    if (logEntries.length > 0) await SS_API.batchAppendRows("Audit_Log", logEntries);
+
+    return { success: true, moved: movedCount };
+  } catch (e) {
+    logger.error('moveHubGroup failed ' + fromLoc + ' -> ' + toLoc, { error: e.message });
+    return { success: false, error: e.toString() };
+  }
+}
+
+/**
+ * Splits part of a row's quantity onto a new row with its own workflow status
+ * -- the Adjust popup's auto-split (SCHEMA v17 item 2).
+ *
+ * Parity with SRC/src/Service_Write.js:1100-1190.
+ *
+ * @param {number} rowIdx 1-based Inventory row.
+ * @param {string} locId
+ * @param {string} sku
+ * @param {*} splitQty
+ * @param {string} newStatus one of Open / Staging / Staged / Labeled.
+ * @param {Object} [context]
+ * @return {Promise<Object>}
+ */
+async function splitInventoryRow(rowIdx, locId, sku, splitQty, newStatus, context) {
+  // Same NaN guard every other qty entry point uses -- '12o' is NaN, and NaN
+  // fails every `<= 0` test below, so an unguarded one would reach the sheet.
+  // See AUDIT_2026-08-24.md B5.
+  const qty = validateQty_(splitQty, "Split quantity");
+  if (!qty.ok) return { success: false, error: qty.error };
+  splitQty = qty.value;
+  if (splitQty <= 0) return { success: false, error: "Split quantity must be greater than 0." };
+
+  // The client is not the trust boundary: an unrecognized status would write a
+  // value that generateLocalTotals()/renderLabels() classify as "not Open"
+  // forever, with no way to see why.
+  const VALID_STATUSES = ["Open", "Staging", "Staged", "Labeled"];
+  newStatus = String(newStatus || "").trim();
+  if (VALID_STATUSES.indexOf(newStatus) === -1) {
+    return { success: false, error: "Unrecognized workflow status '" + newStatus + "'." };
+  }
+
+  try {
+    const data = await SS_API.getSheetValues("Inventory!A:G");
+    const row = data[rowIdx - 1];
+    if (!row) return { success: false, error: "Row data mismatch. The sheet may have been modified." };
+
+    const currentLoc = String(row[0] || "").trim();
+    const currentSku = String(row[1] || "").trim();
+
+    if (currentLoc !== String(locId || "").trim() || currentSku !== String(sku || "").trim()) {
+      return { success: false, error: "Row data mismatch. The sheet may have been modified." };
+    }
+
+    // A _SYS_ row is a Master Hub piece (t:"B") or an assembly Frame (t:"F"):
+    // its comment carries a JSON blob binding it to one build. Copying that blob
+    // onto a second row would fork one build's identity across two rows and
+    // double-count it in every hub rollup (updateDetails() and renderLabels()
+    // both group by pId); dropping it would orphan the split-off half out of its
+    // build entirely. Neither is right, and pulling part of a hub out already
+    // has its own operation -- explodePartialHub(). Refused here rather than
+    // guessed at.
+    if (row[5] && row[5].toString().indexOf("_SYS_") !== -1) {
+      return {
+        success: false,
+        error: "This row is part of an assembly build -- use the hub's Explode action to pull part of it out."
+      };
+    }
+
+    const currentQty = Number(row[2]) || 0;
+    if (splitQty >= currentQty) {
+      return {
+        success: false,
+        error: "Split quantity (" + splitQty + ") must be less than this row's current total (" +
+               currentQty + "). To change the whole row, use the Workflow Status dropdown instead."
+      };
+    }
+    const remainder = currentQty - splitQty;
+
+    // Resolved BEFORE either write, so the new row inherits the lot's true dwell
+    // start instead of reading as a fresh arrival to getAgingData() /
+    // calculateInventoryAgeDays(). Same column-H convention moveInventoryItem()
+    // uses for MOVE_IN -- and the reason "SPLIT_IN" had to be added to
+    // buildAgingData_()'s validActions (Service_Read.js) and to
+    // resolveOriginalArrivalDate()'s own relevantActions: without that, the
+    // split-off row would have NO arrival anchor at all and its location would
+    // read as unknown age.
+    const originalArrivalDate = await resolveOriginalArrivalDate(currentLoc, currentSku);
+
+    await SS_API.batchUpdateValues([
+      { range: `Inventory!C${rowIdx}`, values: [[remainder]] }
+    ]);
+    // Never vacates or deletes the source row: the splitQty < currentQty guard
+    // above means the remainder is always >= 1, which is exactly why this
+    // function carries none of setTotalStockByRow's itemsAtLoc /
+    // vacate-vs-delete branching. Soft kit (col E) and comment (col F) carry
+    // forward -- the split-off units are the same allocation and the same
+    // context notes, just tracked separately from here on.
+    await SS_API.batchAppendRows("Inventory",
+        [[currentLoc, currentSku, splitQty, newStatus, row[4] || "None", row[5] || "", getUuid()]]);
+
+    const userEmail = getActiveUserEmail(context);
+    await SS_API.batchAppendRows("Audit_Log", [
+      [new Date().toISOString(), currentLoc, currentSku, "SPLIT_OUT", splitQty, remainder, userEmail],
+      [new Date().toISOString(), currentLoc, currentSku, "SPLIT_IN", splitQty, splitQty, userEmail,
+        originalArrivalDate ? new Date(originalArrivalDate).toISOString() : ""]
+    ]);
+
+    return { success: true, remainder: remainder, splitQty: splitQty, newStatus: newStatus };
+  } catch (e) {
+    logger.error('splitInventoryRow failed for ' + locId + '/' + sku, { error: e.message });
+    return { success: false, error: e.toString() };
+  }
+}
+
+/**
+ * Records a viewport/user-agent sample from a floor device.
+ *
+ * Writes to its own `Diagnostics` tab. In SRC it used to append into `Config` --
+ * the hand-maintained sheet that also holds the port lead-time table
+ * (getPortGroups_, Service_Dates.js) and STAKEHOLDER_EMAILS. Two problems with
+ * that, both fixed:
+ *
+ *  1. Unbounded machine-generated growth inside a table humans edit by hand.
+ *  2. Worse: when `Config` was missing it CREATED it, with diagnostic headers.
+ *     getPortGroups_() would then find a Config sheet that parses to zero port
+ *     rows and every ETA in the app would silently fall back -- permanently, and
+ *     with no error, because a missing Config throws but a useless one does not.
+ *
+ * This never touches `Config`. See AUDIT_2026-08-24.md B8 and SCHEMA section 4F.
+ * Parity with SRC/src/Service_Write.js:1211-1231.
+ *
+ * @param {number} width
+ * @param {number} height
+ * @param {string} userAgent
+ * @return {Promise<{success: boolean, error?: string}>}
+ */
+async function logDisplayDiagnostic(width, height, userAgent) {
+  const MAX_DIAGNOSTIC_ROWS = 1000;
+  try {
+    await SS_API.batchAppendRows("Diagnostics",
+        [[new Date().toISOString(), width, height, userAgent]]);
+
+    // Keep the tab bounded -- it grows on every manual diagnostic tap and
+    // nothing else ever prunes it. Oldest first, header row preserved.
+    const data = await SS_API.getSheetValues("Diagnostics!A:A");
+    const lastRow = (data || []).length;
+    const overflow = lastRow - (MAX_DIAGNOSTIC_ROWS + 1);
+    if (overflow > 0) {
+      const sheetId = await SS_API.getSheetId("Diagnostics");
+      const rows = [];
+      for (let r = 2; r < 2 + overflow; r++) rows.push(r);
+      await SS_API.batchDeleteRows(sheetId, rows);
+    }
+
+    return { success: true };
+  } catch (e) {
+    // The Diagnostics tab may not exist yet. Unlike SRC this does NOT create it
+    // -- SS_API has no insertSheet, and a diagnostics write is the last thing
+    // that should be minting tabs in the operational workbook, since that exact
+    // creation path is what broke Config (AUDIT B8). Create it by hand once.
+    logger.warn('logDisplayDiagnostic failed', { error: e.message });
+    return { success: false, error: e.toString() };
+  }
+}
+
+/**
+ * The card's live checklist state, keyed by idCheckItem.
+ *
+ * This is the trust boundary for receivePOCardItems: oldQty/oldRcvd arrive FROM
+ * THE BROWSER, and the over-receipt guard used to compute originalExpectedQty
+ * straight from them. Two stations with the same PO open therefore both held
+ * the same stale oldRcvd, both passed the guard, and both appended -- the guard
+ * could not see the other station at all. See AUDIT_2026-08-24.md B6 and
+ * SCHEMA invariant #53. Parity with SRC/src/Service_Write.js:1292-1302.
+ *
+ * @param {string} cardId
+ * @return {Promise<Object<string, {qty: number, rcvd: number}>|null>} null when
+ *     the checklist could not be read at all.
+ */
+async function readLiveChecklistState_(cardId) {
+  const { getExistingCardChecklist } = require('./Service_Read');
+  const live = await getExistingCardChecklist(cardId);
+  if (!live || live.success === false) return null;
+  const byId = {};
+  (live.items || []).forEach(function(it) {
+    if (it && it.idCheckItem) {
+      byId[it.idCheckItem] = { qty: Number(it.qty) || 0, rcvd: Number(it.rcvd) || 0 };
+    }
+  });
+  return byId;
+}
+
 module.exports = {
   modifySheetRow,
+  validateQty_,
+  processAuditAction,
+  bulkVerifyAuditLocations,
+  markAuditComplete,
+  removeItemFromLocation,
+  moveHubGroup,
+  splitInventoryRow,
+  logDisplayDiagnostic,
+  readLiveChecklistState_,
   setTotalStock,
   updateStock,
   addNewItemToLocation,
