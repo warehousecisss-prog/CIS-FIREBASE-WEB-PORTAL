@@ -88,7 +88,7 @@ const CONTRACT = {
   // --- assembly
   buildHardAssembly: 'POST /assembly/build',
   explodeAssembly: 'POST /assembly/explode',
-  explodePartialHub: 'POST /assembly/explode-partial-hub', // 501
+  explodePartialHub: 'POST /assembly/explode-partial-hub',
 
   // --- Trello injector (TrelloInjector.html)
   getTrelloBoards: 'GET /trello/boards',

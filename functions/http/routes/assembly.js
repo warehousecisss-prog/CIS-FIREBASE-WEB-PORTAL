@@ -8,7 +8,7 @@
 const express = require('express');
 
 const Service_Assembly = require('../../services/Service_Assembly');
-const {runMutation, notImplemented} = require('../wrappers');
+const {runMutation} = require('../wrappers');
 
 const router = express.Router();
 
@@ -28,8 +28,15 @@ router.post('/assembly/explode', runMutation('Explode assembly', (req) => {
 }));
 
 // SRC: JS_Handlers.html:4078 `.explodePartialHub(locId, pId, requested)`.
-router.post('/assembly/explode-partial-hub', notImplemented(
-    'explodePartialHub',
-    'Service_Assembly parity -- explodePartialHub, commitInventoryMutation_ and findEffectiveQtyPer_ are unported, and commitInventoryMutation_ needs SS_API.commitAtomic (AUDIT B3) which is also unported'));
+//
+// Partial explode of ONE Master Hub card at ONE location. Answered 501 until
+// Phase 4 Unit E, which landed it together with commitInventoryMutation_ and
+// SS_API.commitAtomic (AUDIT B3) -- they were always going to land together or
+// not at all, since this path is exactly the one whose non-atomic commit could
+// double inventory.
+router.post('/assembly/explode-partial-hub', runMutation('Explode partial hub', (req) => {
+  const {locId, pId, kitsToExplode} = req.body;
+  return Service_Assembly.explodePartialHub(locId, pId, kitsToExplode, req);
+}));
 
 module.exports = router;

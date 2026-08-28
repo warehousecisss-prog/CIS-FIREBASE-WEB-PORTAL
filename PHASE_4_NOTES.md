@@ -1,10 +1,11 @@
-# Phase 4 — the write-path lock, Service_Dates + Service_Conversions parity, and the move locks
+# Phase 4 — the write lock, Service_Dates/Conversions/Assembly parity, and B3
 
 **Date:** 2026-08-28
 **Baseline:** `371ac57` (end of Phase 3)
-**Scope:** four units. Unit A is the write-path lock (AUDIT B7). Unit B is
+**Scope:** five units. Unit A is the write-path lock (AUDIT B7). Unit B is
 `Service_Dates` parity. Unit C locks the three move paths SRC leaves open.
 Unit D is `Service_Conversions` parity, plus four aging-anchor bugs it uncovered.
+Unit E is `Service_Assembly` parity and `SS_API.commitAtomic` (AUDIT B3).
 
 ---
 
@@ -925,3 +926,170 @@ Total executed parity comparisons across the project: **54,941**.
   needs `namesMatch_`, it must await the prime too. A boot-time prime would be
   tidier but would put a PRODUCT read on the cold-start path of every request,
   including ones that never compare a name.
+
+---
+
+# UNIT E — `Service_Assembly` parity and `SS_API.commitAtomic` (AUDIT B3)
+
+These were always going to land together or not at all, exactly as the brief
+said: `explodePartialHub` → `commitInventoryMutation_` → `commitAtomic`.
+
+## 1. What was actually wrong
+
+Every assembly write path committed through **three or four separate Sheets API
+calls**. A quota error, a network fault or a timeout landing between two of them
+corrupts inventory in a way nothing reports:
+
+| Path | The old call sequence | What a failure in the middle does |
+|---|---|---|
+| `buildHardAssembly` | update → **delete** → append → log-append | The consumed components are gone and the assembly was never minted. **Stock destroyed.** |
+| `explodeAssembly` | update → append → log-append → **delete** | The components are restored *and* the assembly rows are still standing. **Stock doubled.** |
+
+Both were live in this port. `buildHardAssembly` is the worse of the two —
+losing stock outright is unrecoverable without a manual count, where doubling at
+least shows up as an implausible number.
+
+`explodePartialHub` did not exist here at all; its route answered 501.
+
+## 2. What landed
+
+| Ported | What it is |
+|---|---|
+| `SS_API.commitAtomic` | One `spreadsheets.batchUpdate` carrying updates + appends + deletes. The API applies it all-or-nothing. |
+| `SS_API._a1ToGridRange`, `SS_API._toCellData` | Its two internals — A1 → GridRange, and one value → one typed CellData. |
+| `commitInventoryMutation_` | The single commit point all three assembly paths now go through. |
+| `findEffectiveQtyPer_` | Walks the recipe tree, multiplying `qtyPer` down through nested levels. |
+| `explodePartialHub` | Partial explode of ONE Master Hub card at ONE location. `POST /assembly/explode-partial-hub` is live. |
+
+All three write paths were rewired to collect their updates/appends/deletes/logs
+and commit once at the end.
+
+### Two guarantees, and neither replaces the other
+
+- **`functions/lock.js`** (Unit A) stops *two writers interleaving*.
+- **`commitAtomic`** stops *one writer half-finishing*.
+
+A build can still fail — but it now fails having changed nothing, rather than
+having deleted the components it was about to consume.
+
+### `Audit_Log` stays outside the atomic set, deliberately
+
+A missing log line is a reporting gap; a half-applied inventory change is a
+data-integrity failure. The log append runs after the commit, and a failure
+there is logged and swallowed rather than being allowed to report a failed
+operation whose inventory effect already landed correctly.
+
+SRC's stated reason is narrower — its log rows carry a live `new Date()`, and a
+Date cannot go through `updateCells` without also setting a `numberFormat`, so
+it would land as a bare `45000`. This port writes ISO strings, so that specific
+constraint does not bite here, but the reporting-gap reasoning stands on its
+own and the structure is kept.
+
+`_toCellData` **throws** on a Date rather than coercing one, so if a future
+caller does route a Date through `commitAtomic` it fails loudly instead of
+writing a serial number into a cell.
+
+## 3. The assembly paths also take the write lease
+
+Same reasoning you approved for the move paths in Unit C, applied consistently:
+all three read the whole Inventory sheet, compute row indices from that one
+snapshot, and then write, append and delete against those indices. `commitAtomic`
+makes that commit atomic; it does **not** stop a second writer from having
+shifted the rows in between.
+
+Leaving brand-new code (`explodePartialHub`) unlocked while `moveInventoryItem`
+is locked would have been shipping a known hole, so all three are wrapped. Same
+`…Locked_` split as everywhere else, so the lock stays one deletable line per
+site. **Flagging it because it is another step beyond SRC** — say the word and
+I will take it back out.
+
+## 4. Verification
+
+Two new harnesses. The important thing about the first is *what it compares*.
+
+### `npm run test:parity:assembly` — 34 comparisons, 21 write scenarios
+
+Both sides return `{success:true}` on the happy path, which proves nothing. So
+this compares **what they write**: both are given a recording `SS_API` — SRC
+through the global it already probes for, the port through a require.cache stub
+— and the two streams of Sheets operations are diffed. A match means the same
+cell updates, the same appended rows, the same deleted row indices, in the same
+order, in the same single atomic call.
+
+Scenarios include the vacate-vs-delete branch, bulk split across two locations,
+a build with no recipe, a malformed payload, a partial explode with children
+remaining elsewhere, the last-pallet case that folds into a full explode, more
+kits than available, and a malformed `_SYS_` blob.
+
+Two things are normalised and the harness says so: freshly-minted UUIDs become
+`<uuid-N>` **in order of first appearance**, so reuse across rows still has to
+match; and timestamps become `<ts>`, since SRC writes `Date` objects where the
+port writes ISO strings.
+
+| Mutation | Result |
+|---|---|
+| B3 reverted — four separate calls, restores before the delete | **13 differences** |
+| `findEffectiveQtyPer_` stops recursing into nested kits | **2 differences** |
+| `explodePartialHub` trusts `kitsToExplode` without the `maxKits` ceiling | **2 differences** |
+
+A fourth mutation (reordering the keys of the `ops` object) changed nothing, and
+correctly did not fail — the ordering guarantee lives inside `commitAtomic`, not
+in its callers. That pointed at a real coverage gap, which is what the second
+harness is for.
+
+### `npm run test:parity:commit` — 17 comparisons
+
+The assembly harness *stubs* `commitAtomic`, so nothing there covered what it
+actually does. This one drives the **real** function on both sides — SRC's
+through a stubbed `Sheets.Spreadsheets` global, the port's through a stubbed
+`googleapis` — and diffs the emitted `requests` array.
+
+Two invariants inside it are load-bearing and invisible from outside:
+
+1. **updates → appends → deletes.** An append lands at the end of the sheet, so
+   it must be emitted before any delete; a delete first shifts the rows the
+   updates and appends were computed against.
+2. **Deletes descending and de-duplicated.** Deleting row 5 shifts row 9 up to
+   row 8, so an ascending list silently deletes the wrong rows.
+
+| Mutation | Result |
+|---|---|
+| deletes sorted ascending | **3 differences** |
+| duplicate delete indices no longer de-duplicated | **1 difference** |
+| a non-finite number written instead of refused | **2 differences** |
+| a Date coerced instead of throwing | **1 difference** |
+| a numeric-looking string routed through `numberValue` | **1 difference** |
+
+That last mutation initially passed, which was a **corpus gap, not a pass**: no
+test string parsed as a number. Added `'12'`, `'0012'`, `'3.50'`, `'1e3'` — a
+SKU like `0012` retyped as a number renders as `12` and the leading zeros are
+gone for good. It fails correctly now.
+
+### Everything else
+
+| Check | Result |
+|---|---|
+| `npm run lint` | ✅ exit 0, 7 warnings (**was 6** — see below) |
+| `npm run test:parity` (six harnesses) | ✅ 54,992 comparisons, 0 differences |
+| `npm run test:routes` | ✅ 82 checks, 0 failures |
+| `npm run test:lock` | ✅ 27 checks, 0 failures |
+| `firebase emulators:exec --only functions` | ✅ clean boot, exit 0 |
+
+**The lint warning count went 6 → 7.** The new one is
+`no-inner-declarations` on `explodePartialHub`'s nested `restoreItemToSheet` —
+identical to the pre-existing warning on `explodeAssembly`'s copy of the same
+helper, and matching SRC's structure. Hoisting it would mean threading seven
+closure variables through as parameters. Left nested, and flagged here so the
+count changing is not a surprise.
+
+## 5. Still open after Unit E
+
+- **The sync/webhook functions** are now the largest body of unported code by a
+  wide margin: `syncAllBoardsToShipmentsTab` (35KB), `Webhook_Receiver` (33KB),
+  `evaluateRollupStatuses` (20KB), `pushOutboundToShippingSchedule` (35KB),
+  `Service_Router` (12KB).
+- **`Fedex_Master_Script.js`** (31KB) still accounts for four of the remaining
+  eight 501 routes.
+- **`Service_PO_Ingest`** is missing `extractTextFromPdfBlob` — the actual
+  `pdf-parse` invocation — so PO ingest cannot read a PDF at all.
+- **`cleanUpVacantRows` is still unlocked** (flagged in Unit C, unchanged).

@@ -27,13 +27,17 @@
 >   aging-anchor bugs** in `Service_Read`/`Service_Write` and the fact that
 >   nothing was priming the product-identity index at all. Two more parity
 >   harnesses.
+> - **Phase 4, Unit E** (`PHASE_4_NOTES.md`): `Service_Assembly` parity and
+>   `SS_API.commitAtomic` (AUDIT B3) — the assembly write paths were committing
+>   through 3-4 separate API calls, so a failure mid-way doubled or destroyed
+>   stock. `explodePartialHub` is live. Two more parity harnesses.
 >
-> Sections below are annotated where they are now out of date. The next
-> bottleneck is the **sync/webhook functions** (`syncAllBoardsToShipmentsTab`,
-> `evaluateRollupStatuses`, `Webhook_Receiver`), and **`Service_Assembly`
-> parity** — which must land together with `SS_API.commitAtomic` — is the
-> largest remaining service-level gap. The routes exist, so what is missing is
-> now visible as a 501 rather than as a 404. Nine routes still answer 501.
+> Sections below are annotated where they are now out of date. **Every backend
+> service is now at or near parity.** The next bottleneck is the
+> **sync/webhook functions** (`syncAllBoardsToShipmentsTab`,
+> `evaluateRollupStatuses`, `Webhook_Receiver`, `pushOutboundToShippingSchedule`,
+> `Service_Router` — 135KB between them), then `Fedex_Master_Script` and the
+> frontend. Eight routes still answer 501; four of them are FedEx.
 
 > Purpose: an honest map of what is actually ported, what is stubbed, and what
 > hasn't been started — so the remaining work can be sequenced. The existing
@@ -48,17 +52,17 @@
 | Layer | State | Notes |
 |---|---|---|
 | Firebase scaffold | ~~**Usable**~~ **Fixed (Phase 1)** | `.firebaserc`, shared `firebase-admin` init, `config.js`, auth middleware, ESLint config all added. Node engine now `22`. |
-| `Service_SheetsAPI` (SS_API) | ~~**Blocking bug**~~ **Fixed (Phase 1)** | Writes use `RAW` + `INSERT_ROWS`. Real gid resolution via `getSheetId()`. `getSpreadsheetId()` reads `BATCH_SHEET_ID`. |
+| `Service_SheetsAPI` (SS_API) | ~~**Blocking bug**~~ **Fixed (Phase 1)**, **`commitAtomic` added (Phase 4E)** | Writes use `RAW` + `INSERT_ROWS`. Real gid resolution via `getSheetId()`. `getSpreadsheetId()` reads `BATCH_SHEET_ID`. `batchUpdateSheet()` (4B) and `commitAtomic()` (4E, AUDIT B3) complete the write surface. |
 | `Service_Read` | ~~**~65%**~~ **~95% (Phase 2)** | Label management, shipping-reference r/w, SKU-last-updated map and the board matrix all ported. Only `testReadMPS` (a manual Logger harness) is absent. **Phase 3 found three more gaps:** `findOrCreatePOCardAndInject` was creating Trello labels and had lost `idLabel` (fixed, F3); `getAllInventory` drops the Instance_ID column (F5) and returns `null` where SRC rethrows (F6, AUDIT A4). |
 | `Service_Write` | ~~**~45%**~~ **~95% (Phase 2)** | A1 silent-failure fixed; 9 of 10 missing functions ported (`validateQty_`, `splitInventoryRow`, `moveHubGroup`, audit actions, …). B5/B6/A3 fixed. Only `testReceivingDataFlow` (a manual Logger harness) is absent. **Phase 3 found two more gaps:** `moveInventoryItem` had lost `clientAssertsKnownCoordinate` (fixed, F1) and still listed `ZONE-STAGED` as a virtual zone (fixed, F2 — Phase 4). **Phase 4 also added the write lease and restored `receivePOCardItems`' missing re-check-under-lock.** |
 | `Service_Dates` | ~~**~55%**~~ **~98% (Phase 4B)** | `estimateShipByDateV2` (SCHEMA **§4G** — *not* §8 Engine 4, which is the FedEx CSV batch tool), override detection, comment backfill and bot-account logic all ported. F4 was three missing pieces, not two — the third, a lost exact-`Port`-first match in `findTransitLane_`, had reintroduced the 2026-08-21 port-collision bug on **every** ETA recompute. 45,850-comparison parity harness. |
 | `Service_Conversions` | ~~**~30%**~~ **~100% (Phase 4D)** | Case-breakdown / units-per-case engine ported, and `findCaseConversion` restored to resolving the SKU to its QB name first — without that, the put-away conversion had stopped firing for everything received since 2026-08-11, silently. 7,401-comparison parity harness. Note the `CASE_CONVERSIONS` tab does not exist in the live workbook on either side. |
-| `Service_Assembly` | **~60%** | build + explode ported; `explodePartialHub`, `commitInventoryMutation_`, `findEffectiveQtyPer_` missing. |
+| `Service_Assembly` | ~~**~60%**~~ **~100% (Phase 4E)** | `explodePartialHub`, `commitInventoryMutation_` and `findEffectiveQtyPer_` ported, and all three write paths rewired through one atomic commit (AUDIT B3). Before this, `buildHardAssembly` deleted the consumed components in one call and minted the assembly in a later one — a failure in between **destroyed stock**; `explodeAssembly` was the mirror image and **doubled** it. Parity harness compares the emitted Sheets operations, not the return value. |
 | `Service_PO_Ingest` | **~60%** | Parser ported; **`extractTextFromPdfBlob` (the actual pdf-parse call) missing**, supplier email missing. |
 | `Service_RXO` | **~80%** | Cleanest port. Missing config-status + diagnostics harness helpers. |
 | `Service_Validate` | **~85%** | Ported; board-id check against env still a comment. |
 | `Service_Diagnostics` / `Service_Email` | Ported / new | Email is a fresh nodemailer wrapper (no original). |
-| HTTP routes | ~~**~5%**~~ **Done (Phase 3)** | `functions/http/` — 71 routes, all 64 SRC client calls covered, common `runMutation` wrapper, 82-check contract test (`npm run test:routes`). ~~10~~ **9** routes answer **501** naming the unported service behind them — `estimateShipByDateV2` went live in Phase 4B. |
+| HTTP routes | ~~**~5%**~~ **Done (Phase 3)** | `functions/http/` — 71 routes, all 64 SRC client calls covered, common `runMutation` wrapper, 82-check contract test (`npm run test:routes`). ~~10~~ **8** routes answer **501** naming the unported service behind them — `estimateShipByDateV2` went live in Phase 4B and `explodePartialHub` in 4E. |
 | Not ported at all | — | ~~`Shared_Classifiers`~~ **(ported, Phase 2)**, `Webhook_Receiver`, `syncAllBoardsToShipmentsTab`, `evaluateRollupStatuses`, `pushOutboundToShippingSchedule`, `Service_Router`, `Fedex_Master_Script`, HTS tools. |
 | Frontend views | **~10%** | Shell + 14 map SVGs converted. All views are placeholder/dummy-data. Client engine (`JS_Handlers` 337KB, `JS_Render_UI` 145KB) not ported. |
 
@@ -206,9 +210,12 @@ product-identity index was empty in every request and every name comparison had
 silently degraded to plain-key matching — the exact weakening SCHEMA invariant
 #69 exists to prevent. Now awaited at the sites that need it.
 
-### `Service_Assembly.js` (3 missing)
-`commitInventoryMutation_` (the shared atomic write helper) · `findEffectiveQtyPer_`
-(recursive BOM qty resolution) · `explodePartialHub`
+### `Service_Assembly.js` — **RESOLVED in Phase 4, Unit E**
+~~`commitInventoryMutation_`~~ · ~~`findEffectiveQtyPer_`~~ · ~~`explodePartialHub`~~
+→ Landed together with `SS_API.commitAtomic`, as they had to: the whole point of
+`commitInventoryMutation_` is that it routes through an atomic commit.
+→ All three assembly write paths also take the write lease now — a step beyond
+SRC, on the same reasoning as the move paths in Unit C.
 
 ### `Service_PO_Ingest.js` (3 missing)
 `extractTextFromPdfBlob` (**the pdf-parse invocation itself**) · `emailPOPdfToSupplier` ·
