@@ -9,7 +9,6 @@
  */
 
 const express = require('express');
-const logger = require('firebase-functions/logger');
 
 const Service_Dates = require('../../services/Service_Dates');
 const Service_Write = require('../../services/Service_Write');
@@ -43,29 +42,27 @@ router.post('/shipment', runMutation('Update shipment readiness', (req) => {
 // fields are a form submission, and putting a free-text destination and port
 // in a query string puts them in every access log for no benefit.
 //
-// PARITY GAP: the ported service signature is 5-arg and has no `port`. Its
-// findTransitLane_ is missing SRC's opts.port narrowing block AND
-// resolveTransitDestinationCluster_, so a destination fed by more than one
-// port silently resolves to whichever lane the slowest-wins default picks --
-// exactly the bug SRC's comment at JS_Handlers.html:2322 says the Destination/
-// Port split was introduced to fix. Restoring it is Service_Dates parity
-// (Phase 4), not route work, so the route takes `port`, refuses to pretend it
-// was honoured, and says so out loud. See PHASE_3_NOTES.md finding F4.
+// `port` is now honoured. Phase 3 shipped this route with a logger.warn saying
+// the ported service dropped the parameter (F4); Phase 4 Unit B restored it,
+// along with findTransitLane_'s port-narrowing block and
+// resolveTransitDestinationCluster_, so the warning is gone.
 router.post('/shipping/estimate-window', runMutation('Estimate shipping window', (req) => {
   const {readyDateStr, travelType, origin, destination, port, loadType} = req.body;
-  if (port) {
-    logger.warn('estimateShippingWindowV2: `port` was supplied but the ported service ' +
-      'does not narrow by it (Service_Dates parity gap, PORT_AUDIT.md). The returned ' +
-      'lane may be for a different port of the same destination.', {port, destination});
-  }
-  return Service_Dates.estimateShippingWindowV2(readyDateStr, travelType, origin, destination, loadType);
+  return Service_Dates.estimateShippingWindowV2(
+      readyDateStr, travelType, origin, destination, port, loadType);
 }));
 
 // SRC: JS_Handlers.html:3024
 //   `.estimateShipByDateV2(dateStr, type, origin, dest, port, load)`.
-router.post('/shipping/estimate-ship-by', notImplemented(
-    'estimateShipByDateV2',
-    'Service_Dates parity -- SCHEMA §8 Engine 4, the reverse (must-arrive-by -> latest ship date) calculation, is unported (PORT_AUDIT.md)'));
+//
+// The reverse calculation: a hard must-arrive-by date -> the latest date the
+// goods can leave the origin. Same lane narrowing and same slowest-wins default
+// as estimate-window above. SCHEMA §4G. Answered 501 until Phase 4 Unit B.
+router.post('/shipping/estimate-ship-by', runMutation('Estimate ship-by date', (req) => {
+  const {arriveByDateStr, travelType, origin, destination, port, loadType} = req.body;
+  return Service_Dates.estimateShipByDateV2(
+      arriveByDateStr, travelType, origin, destination, port, loadType);
+}));
 
 // SRC: JS_Handlers.html:1910 `.stageBulkFedExTrackingNumbers(stagedOrders)`.
 router.post('/fedex/stage-tracking', runMutation('Stage FedEx tracking numbers', (req) => {

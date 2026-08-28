@@ -16,11 +16,16 @@
 >   `functions/lock.js`, a Firestore lease behind one `withInventoryLock(fn)`.
 >   Also fixed F2 and restored the re-check-under-lock missing from
 >   `receivePOCardItems`.
+> - **Phase 4, Unit B** (`PHASE_4_NOTES.md`): `Service_Dates` parity — 14
+>   functions including `estimateShipByDateV2`, and F4, which turned out to be
+>   THREE missing pieces rather than two. 45,850-comparison parity harness.
+>   `backfillIgnoreCommentsFromComments_` unblocked.
 >
 > Sections below are annotated where they are now out of date. The next
-> bottleneck is **`Service_Dates` parity** (`estimateShipByDateV2`, SCHEMA §8
-> Engine 4) and the **sync/webhook functions** — the routes exist, so what is
-> missing is now visible as a 501 rather than as a 404.
+> bottleneck is the **sync/webhook functions** (`syncAllBoardsToShipmentsTab`,
+> `evaluateRollupStatuses`, `Webhook_Receiver`) and **`Service_Conversions`
+> parity** — the routes exist, so what is missing is now visible as a 501 rather
+> than as a 404. Nine routes still answer 501.
 
 > Purpose: an honest map of what is actually ported, what is stubbed, and what
 > hasn't been started — so the remaining work can be sequenced. The existing
@@ -38,14 +43,14 @@
 | `Service_SheetsAPI` (SS_API) | ~~**Blocking bug**~~ **Fixed (Phase 1)** | Writes use `RAW` + `INSERT_ROWS`. Real gid resolution via `getSheetId()`. `getSpreadsheetId()` reads `BATCH_SHEET_ID`. |
 | `Service_Read` | ~~**~65%**~~ **~95% (Phase 2)** | Label management, shipping-reference r/w, SKU-last-updated map and the board matrix all ported. Only `testReadMPS` (a manual Logger harness) is absent. **Phase 3 found three more gaps:** `findOrCreatePOCardAndInject` was creating Trello labels and had lost `idLabel` (fixed, F3); `getAllInventory` drops the Instance_ID column (F5) and returns `null` where SRC rethrows (F6, AUDIT A4). |
 | `Service_Write` | ~~**~45%**~~ **~95% (Phase 2)** | A1 silent-failure fixed; 9 of 10 missing functions ported (`validateQty_`, `splitInventoryRow`, `moveHubGroup`, audit actions, …). B5/B6/A3 fixed. Only `testReceivingDataFlow` (a manual Logger harness) is absent. **Phase 3 found two more gaps:** `moveInventoryItem` had lost `clientAssertsKnownCoordinate` (fixed, F1) and still listed `ZONE-STAGED` as a virtual zone (fixed, F2 — Phase 4). **Phase 4 also added the write lease and restored `receivePOCardItems`' missing re-check-under-lock.** |
-| `Service_Dates` | **~55%** | Forward ETA estimate ported. Reverse `estimateShipByDateV2` (SCHEMA §8 Engine 4), override detection, comment backfill, bot-account logic all missing. |
+| `Service_Dates` | ~~**~55%**~~ **~98% (Phase 4B)** | `estimateShipByDateV2` (SCHEMA **§4G** — *not* §8 Engine 4, which is the FedEx CSV batch tool), override detection, comment backfill and bot-account logic all ported. F4 was three missing pieces, not two — the third, a lost exact-`Port`-first match in `findTransitLane_`, had reintroduced the 2026-08-21 port-collision bug on **every** ETA recompute. 45,850-comparison parity harness. |
 | `Service_Conversions` | **~30%** | `planCaseConversion` shell ported; the case-breakdown / units-per-case engine (recent CHANGELOG work) is gone. |
 | `Service_Assembly` | **~60%** | build + explode ported; `explodePartialHub`, `commitInventoryMutation_`, `findEffectiveQtyPer_` missing. |
 | `Service_PO_Ingest` | **~60%** | Parser ported; **`extractTextFromPdfBlob` (the actual pdf-parse call) missing**, supplier email missing. |
 | `Service_RXO` | **~80%** | Cleanest port. Missing config-status + diagnostics harness helpers. |
 | `Service_Validate` | **~85%** | Ported; board-id check against env still a comment. |
 | `Service_Diagnostics` / `Service_Email` | Ported / new | Email is a fresh nodemailer wrapper (no original). |
-| HTTP routes | ~~**~5%**~~ **Done (Phase 3)** | `functions/http/` — 71 routes, all 64 SRC client calls covered, common `runMutation` wrapper, 82-check contract test (`npm run test:routes`). 10 routes answer **501** naming the unported service behind them. |
+| HTTP routes | ~~**~5%**~~ **Done (Phase 3)** | `functions/http/` — 71 routes, all 64 SRC client calls covered, common `runMutation` wrapper, 82-check contract test (`npm run test:routes`). ~~10~~ **9** routes answer **501** naming the unported service behind them — `estimateShipByDateV2` went live in Phase 4B. |
 | Not ported at all | — | ~~`Shared_Classifiers`~~ **(ported, Phase 2)**, `Webhook_Receiver`, `syncAllBoardsToShipmentsTab`, `evaluateRollupStatuses`, `pushOutboundToShippingSchedule`, `Service_Router`, `Fedex_Master_Script`, HTS tools. |
 | Frontend views | **~10%** | Shell + 14 map SVGs converted. All views are placeholder/dummy-data. Client engine (`JS_Handlers` 337KB, `JS_Render_UI` 145KB) not ported. |
 
@@ -140,14 +145,24 @@ nothing, a missing `productId` field on `getProductMap` entries that silently
 defeated the Inventory identity fix, and `getTrelloBoards` returning every board
 the token can see instead of the 4-board matrix. See `PHASE_2_NOTES.md` §4.
 
-### `Service_Dates.js` (~16 missing)
-`estimateShipByDateV2` (reverse calc — SCHEMA §8 Engine 4, the batch ship-by
-estimator) · `getDeliveryDestinationCatalog_` · `resolveTransitDestinationCluster_` ·
-`computeShipmentDates_` present but check body · `detectMissedDueDateOverrides_` ·
-`backfillReadyPortFromComments_` · `getLastAutoDueForCard_` · `markEtaOverridden_` ·
-`getTrelloMemberInfo_` · `identifyTrelloBotAccount` · `fetchCardComments_` ·
-`findLatestReadyPortInfo_` · `getPeakSeasonWindow_` present · `setupShipmentDateColumns`
-→ `estimateShippingWindowV2` also lost its `port` parameter in the port.
+### `Service_Dates.js` — **RESOLVED in Phase 4, Unit B**
+~~`estimateShipByDateV2`~~ · ~~`getDeliveryDestinationCatalog_`~~ ·
+~~`resolveTransitDestinationCluster_`~~ · ~~`detectMissedDueDateOverrides_`~~ ·
+~~`backfillReadyPortFromComments_`~~ · ~~`getLastAutoDueForCard_`~~ ·
+~~`markEtaOverridden_`~~ · ~~`getTrelloMemberInfo_`~~ · ~~`identifyTrelloBotAccount`~~ ·
+~~`fetchCardComments_`~~ · ~~`findLatestReadyPortInfo_`~~ · ~~`setupShipmentDateColumns`~~
+→ `computeShipmentDates_` and `getPeakSeasonWindow_` were checked against SRC and
+are at parity — the latter had lost its diagnostic logging, now restored.
+→ `estimateShippingWindowV2`'s `port` parameter is restored and
+`findTransitLane_` honours it. See `PHASE_4_NOTES.md` §Unit B/2 for the third,
+previously unrecorded, piece of F4 — the one that mattered most, because it sat
+on the path every ETA recompute takes.
+→ Also fixed while in there: `TRAVEL_TYPE_LABELS` was missing `TRUCKING`;
+`getTransitLaneCatalog` was missing `deliveryDestinations`, which *is* the
+Destination dropdown; two Trello error strings rendered `undefined`; and
+`formatDateCell_` could write the literal `"NaN/NaN/NaN"` into a sheet cell.
+→ **Note:** `estimateShipByDateV2` is SCHEMA **§4G**. §8's Engine 4 is
+`batchCalculateTransitTimes()`, the FedEx CSV batch estimator, still a 501.
 
 ### `Service_Conversions.js` (~5 missing — `getQbNameIndex_` done in Phase 2)
 ~~`getQbNameIndex_`~~ (ported into `Shared_Classifiers` as `primeQbNameIndex` /
@@ -178,7 +193,7 @@ this matters less than it did, but it is not yet at parity.
 
 | File | Size | Role | Port target |
 |---|---|---|---|
-| ~~`Shared_Classifiers.js`~~ | 44KB | **PORTED (Phase 2)** to `functions/services/Shared_Classifiers.js`, with a parity harness (`npm run test:parity`, 1492 comparisons). A client-side duplicate is still needed. |
+| ~~`Shared_Classifiers.js`~~ | 44KB | **PORTED (Phase 2)** to `functions/services/Shared_Classifiers.js`, with a parity harness (`npm run test:parity`, 1492 comparisons). `backfillIgnoreCommentsFromComments_` landed in Phase 4B, once `fetchCardComments_` existed to unblock it. A client-side duplicate is still needed. |
 | `Webhook_Receiver.js` | 33KB | Real-time Trello card-update webhook | `onRequest` function |
 | `syncAllBoardsToShipmentsTab.js` | 35KB | Scheduled full board→SHIPMENTS pull | `onSchedule` (currently a no-op `scheduledSync`) |
 | `evaluateRollupStatuses.js` | 20KB | Rollup status state machine | service module, called by sync |
@@ -234,17 +249,20 @@ Still open:
 5. ~~**Build the HTTP route layer**~~ — **DONE 2026-08-28** (`PHASE_3_NOTES.md`).
    `functions/http/`, 71 routes, one `runMutation` wrapper, machine-checked
    against the 64 SRC client calls.
-6. **`Service_Dates` parity** incl. `estimateShipByDateV2`. **← in progress
-   (Phase 4, Unit B).** Also
-   picks up `estimateShippingWindowV2`'s lost `port` parameter and its missing
-   `findTransitLane_` port-narrowing (Phase 3, F4).
+6. ~~**`Service_Dates` parity** incl. `estimateShipByDateV2`~~ — **DONE
+   2026-08-28** (`PHASE_4_NOTES.md`, Unit B). Also picked up
+   `estimateShippingWindowV2`'s lost `port` parameter and `findTransitLane_`'s
+   missing port-narrowing (Phase 3, F4) — plus a third piece of F4 that Phase 3
+   had not spotted.
 7. **Sync + webhook functions** (`syncAllBoardsToShipmentsTab`,
    `evaluateRollupStatuses`, `Webhook_Receiver`).
 8. **Frontend**: real data wiring, then views one at a time
    (Dashboard → FedEx → Maps → Injector → Limbo/Staged).
 
-Steps 1–5 are done. Step 6 is in progress (`PHASE_4_NOTES.md`), preceded by the
-write-path lock, which was blocking nothing but was blocking-adjacent to
+Steps 1–6 are done. **Step 7 (sync + webhook functions) is the next
+bottleneck**, and `Service_Conversions` parity is the largest remaining
+service-level gap. Phase 4 also delivered the write-path lock, which never
+appeared in this list because it was blocking nothing — and blocking-adjacent to
 everything.
 
 Two gaps span everything above and are worth deciding on before much more is
@@ -260,4 +278,6 @@ built on the write path:
   `npm run test:lock` (26 checks incl. real Firestore transactions).
   **Firestore must be enabled on the project before deploy.**
 - **`SS_API.commitAtomic` not ported (AUDIT B3).** Its only callers are the
-  assembly write paths, which are still unported.
+  assembly write paths, which are still unported. Phase 4B added
+  `SS_API.batchUpdateSheet()` — the atomic `spreadsheets.batchUpdate`
+  passthrough this needs — so the primitive is now in place.

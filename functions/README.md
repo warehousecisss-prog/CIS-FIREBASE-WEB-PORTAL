@@ -126,6 +126,13 @@ Appends also pass `insertDataOption: "INSERT_ROWS"` — the API default is
 detection so an overwrite-mode append lands mid-sheet and destroys live rows
 (`AUDIT_2026-08-24.md` B2).
 
+`batchUpdateSheet(requests)` is the structural/formatting escape hatch —
+`repeatCell`, `setDataValidation`, `updateCells`, `deleteDimension`. Two things
+it is **not**: a way around the `RAW` rule (`updateCells` carries its own
+`userEnteredValue`, which Sheets parses exactly as `USER_ENTERED` would, so
+values still go through `batchUpdateValues`), and a general-purpose door. One
+call of it is atomic, which is the property `commitAtomic` (`AUDIT` B3) needs.
+
 ## Write-path contract
 
 Mutations return a result object and never report success when nothing was

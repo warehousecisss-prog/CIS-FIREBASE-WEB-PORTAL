@@ -121,7 +121,7 @@ const CONTRACT = {
   // --- shipping dates / FedEx
   updateShipmentReadiness: 'POST /shipment',
   estimateShippingWindowV2: 'POST /shipping/estimate-window',
-  estimateShipByDateV2: 'POST /shipping/estimate-ship-by', // 501
+  estimateShipByDateV2: 'POST /shipping/estimate-ship-by',
   stageBulkFedExTrackingNumbers: 'POST /fedex/stage-tracking',
   markFedExChildDeliveredInSheet: 'POST /fedex/mark-child-delivered',
   batchCalculateTransitTimes: 'POST /fedex/batch-transit-times', // 501
@@ -236,7 +236,10 @@ app.get('/t/read-refused', runQuery('Read refused', () => ({
 
 app.get('/t/read-ok', runQuery('Read ok', () => [['SWH-A-01', 'WIDGET-X-100', 12]]));
 
-app.post('/t/unported', notImplemented('estimateShipByDateV2', 'Service_Dates parity'));
+// Named after a call that is still genuinely unported. estimateShipByDateV2
+// used to stand here; it landed in Phase 4 Unit B, and a fixture naming a
+// function that now works reads as a stale test.
+app.post('/t/unported', notImplemented('explodePartialHub', 'Service_Assembly parity'));
 
 const server = http.createServer(app);
 
@@ -345,7 +348,8 @@ server.listen(0, '127.0.0.1', async () => {
   check('an unported call is a 501 naming what it waits on', () => {
     assert.strictEqual(unported.status, 501);
     assert.strictEqual(unported.body.notImplemented, true);
-    assert.ok(/Service_Dates parity/.test(unported.body.error));
+    assert.ok(/Service_Assembly parity/.test(unported.body.error));
+    assert.ok(/explodePartialHub/.test(unported.body.error));
   });
 
   console.log('\n  transcript:');

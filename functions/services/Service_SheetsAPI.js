@@ -264,6 +264,45 @@ const SS_API = {
   },
 
   /**
+   * Sends raw `spreadsheets.batchUpdate` requests -- the structural/formatting
+   * half of the Sheets API that `spreadsheets.values.*` cannot reach:
+   * `repeatCell` (formatting), `setDataValidation` (dropdowns), `updateCells`,
+   * `appendCells`, `deleteDimension`.
+   *
+   * Deliberately thin, and deliberately NOT a general escape hatch from the
+   * rules the other methods enforce. Two things to know before using it:
+   *
+   *  - **It bypasses `valueInputOption: "RAW"`.** `updateCells`/`appendCells`
+   *    carry their own per-cell `userEnteredValue`, and a string put in there
+   *    is parsed by Sheets exactly as USER_ENTERED would (AUDIT B1: a checklist
+   *    item named "-3M SLIDE" becomes a formula and renders #NAME? forever).
+   *    Write VALUES through `batchUpdateValues`; use this for structure.
+   *  - **One call is atomic.** Every request in the array applies or none does,
+   *    which is the property AUDIT B3 (`commitAtomic`, the assembly write path)
+   *    needs and which four sequential `values.*` calls cannot provide.
+   *
+   * @param {Array<Object>} requests Sheets API `Request` objects.
+   * @return {Promise<Object>} the API's batchUpdate reply.
+   */
+  batchUpdateSheet: async function(requests) {
+    if (!requests || requests.length === 0) return null;
+
+    const spreadsheetId = getSpreadsheetId();
+    const sheets = await getSheetsClient();
+
+    try {
+      const response = await sheets.spreadsheets.batchUpdate({
+        spreadsheetId,
+        resource: { requests: requests }
+      });
+      return response.data;
+    } catch (e) {
+      logger.error('SS_API.batchUpdateSheet Error:', e);
+      throw e;
+    }
+  },
+
+  /**
    * Reads all values from a specific sheet.
    * @param {string} range e.g., "CUSTOMER_REGISTRY!A:G"
    * @return {Promise<Array<Array<*>>>}

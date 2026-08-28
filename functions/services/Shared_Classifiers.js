@@ -418,6 +418,101 @@ function parseIgnoreComment_(commentText) {
 }
 
 /**
+ * Catch-up pass for the `.ignore` / `.unignore` comment trigger.
+ *
+ * WHY THIS EXISTS (SCHEMA §12, confirmed live 2026-08-17): a card had a clean
+ * `.ignore` comment posted the same day the feature shipped, which never took
+ * effect -- the card kept showing on the dashboard indefinitely with no error
+ * anywhere. Unlike the READY/PORT feature, which has
+ * `backfillReadyPortFromComments_()` wired into every sync specifically to
+ * catch whatever its real-time webhook missed, the `.ignore` trigger shipped
+ * with NO catch-up path: if the commentCard webhook ever missed a declaration
+ * (posted before that day's deploy landed, a dropped delivery, the 3-second
+ * debounce lock in doPost colliding on the same card, a mid-request error), it
+ * was lost permanently with no recovery except noticing and re-posting the
+ * comment by hand. This closes that gap the same way READY/PORT closes it.
+ *
+ * MANUALLY RUN, not wired into the periodic sync -- checking comments costs one
+ * extra Trello API call per card, and `.ignore` is a rare deliberate action, not
+ * worth paying that on every cycle for every row. Safe to re-run: a card already
+ * in the correct state is a cheap no-op.
+ *
+ * This was blocked through Phase 2 and Phase 3 waiting on `fetchCardComments_`
+ * and `SHIPMENTS_COL` from Service_Dates, both of which landed in Phase 4
+ * Unit B. The require is INSIDE the function, not at the top of the file: this
+ * module sits at the bottom of the dependency graph and Service_Dates requires
+ * it, so a top-level import would be a cycle. Same idiom as Service_Write's
+ * readLiveChecklistState_.
+ *
+ * Parity with SRC/src/Shared_Classifiers.js:466-517.
+ *
+ * @return {Promise<{success: boolean, checked?: number, fixed?: number, error?: string}>}
+ */
+async function backfillIgnoreCommentsFromComments_() {
+  const SS_API = require('./Service_SheetsAPI');
+  const {fetchCardComments_, SHIPMENTS_COL} = require('./Service_Dates');
+
+  try {
+    const data = await SS_API.getSheetValues('SHIPMENTS!A:J');
+    if (!data) return {success: false, error: 'SHIPMENTS sheet not found.'};
+    if (data.length < 2) return {success: true, checked: 0, fixed: 0};
+
+    let checked = 0;
+    let fixed = 0;
+    const updates = [];
+
+    for (let i = 1; i < data.length; i++) {
+      const cardId = String(data[i][SHIPMENTS_COL.CARD_ID] || '').trim();
+      if (!cardId) continue;
+      checked++;
+
+      const comments = await fetchCardComments_(cardId);
+      let latestAction = null;
+      for (let j = 0; j < comments.length; j++) { // newest first -- first match wins
+        const parsed = parseIgnoreComment_(comments[j].text);
+        if (parsed) { latestAction = parsed; break; }
+      }
+      if (!latestAction) continue;
+
+      const currentSummary = String(data[i][SHIPMENTS_COL.LINE_ITEMS] || '');
+      const currentlyMarkedIgnored = currentSummary.indexOf(PORTAL_IGNORED_MARKER) === 0;
+      const shouldBeIgnored = (latestAction === 'IGNORE');
+      if (currentlyMarkedIgnored === shouldBeIgnored) continue; // already consistent
+
+      const updatedLabels = await applyIgnoreDeclaration_(cardId, latestAction);
+      if (!updatedLabels) continue; // Trello write failed -- logged inside applyIgnoreDeclaration_
+
+      // Rewrites the summary's marker prefix directly rather than re-deriving
+      // the whole summary via formatInboundLineItems(): a full re-derivation
+      // isn't needed just to toggle one marker, and doing it here means the fix
+      // is visible on the very next dashboard poll rather than waiting for
+      // another full sync.
+      const strippedSummary = currentlyMarkedIgnored ?
+        currentSummary.slice(PORTAL_IGNORED_MARKER.length).replace(/^\n/, '') :
+        currentSummary;
+      const newSummary = shouldBeIgnored ?
+        (PORTAL_IGNORED_MARKER + '\n' + strippedSummary) :
+        strippedSummary;
+
+      updates.push({range: 'SHIPMENTS!H' + (i + 1), values: [[newSummary]]});
+      data[i][SHIPMENTS_COL.LINE_ITEMS] = newSummary;
+
+      fixed++;
+      logger.info('backfillIgnoreCommentsFromComments_: ' + latestAction + ' applied for ' +
+          cardId + ' (comment predates or was missed by the real-time webhook).');
+    }
+
+    if (updates.length > 0) await SS_API.batchUpdateValues(updates);
+    logger.info('backfillIgnoreCommentsFromComments_: checked ' + checked +
+        ' card(s), fixed ' + fixed + '.');
+    return {success: true, checked: checked, fixed: fixed};
+  } catch (e) {
+    logger.error('backfillIgnoreCommentsFromComments_ failed', {error: e.message});
+    return {success: false, error: e.toString()};
+  }
+}
+
+/**
  * Trello API key/token.
  *
  * SRC keeps this in Service_Dates.js:1259 and reaches it through Apps Script's
@@ -996,6 +1091,7 @@ module.exports = {
   formatInboundLineItems,
   parseIgnoreComment_,
   applyIgnoreDeclaration_,
+  backfillIgnoreCommentsFromComments_,
   // Product identity
   primeQbNameIndex,
   getQbNameIndex_,
