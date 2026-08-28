@@ -31,13 +31,18 @@
 >   `SS_API.commitAtomic` (AUDIT B3) — the assembly write paths were committing
 >   through 3-4 separate API calls, so a failure mid-way doubled or destroyed
 >   stock. `explodePartialHub` is live. Two more parity harnesses.
+> - **Phase 4, Unit F** (`PHASE_4_NOTES.md`): outbound email — `Service_Email`
+>   was ignoring all five SMTP_* config keys and hardcoding placeholder
+>   credentials; `emailPOPdfToSupplier` ported. Also a **correction to this
+>   document**, see `Service_PO_Ingest` below.
 >
 > Sections below are annotated where they are now out of date. **Every backend
 > service is now at or near parity.** The next bottleneck is the
 > **sync/webhook functions** (`syncAllBoardsToShipmentsTab`,
 > `evaluateRollupStatuses`, `Webhook_Receiver`, `pushOutboundToShippingSchedule`,
 > `Service_Router` — 135KB between them), then `Fedex_Master_Script` and the
-> frontend. Eight routes still answer 501; four of them are FedEx.
+> frontend. Seven routes still answer 501 — three FedEx, three RXO, one HTS —
+> and every one waits on a whole unported file rather than a missing function.
 
 > Purpose: an honest map of what is actually ported, what is stubbed, and what
 > hasn't been started — so the remaining work can be sequenced. The existing
@@ -58,11 +63,11 @@
 | `Service_Dates` | ~~**~55%**~~ **~98% (Phase 4B)** | `estimateShipByDateV2` (SCHEMA **§4G** — *not* §8 Engine 4, which is the FedEx CSV batch tool), override detection, comment backfill and bot-account logic all ported. F4 was three missing pieces, not two — the third, a lost exact-`Port`-first match in `findTransitLane_`, had reintroduced the 2026-08-21 port-collision bug on **every** ETA recompute. 45,850-comparison parity harness. |
 | `Service_Conversions` | ~~**~30%**~~ **~100% (Phase 4D)** | Case-breakdown / units-per-case engine ported, and `findCaseConversion` restored to resolving the SKU to its QB name first — without that, the put-away conversion had stopped firing for everything received since 2026-08-11, silently. 7,401-comparison parity harness. Note the `CASE_CONVERSIONS` tab does not exist in the live workbook on either side. |
 | `Service_Assembly` | ~~**~60%**~~ **~100% (Phase 4E)** | `explodePartialHub`, `commitInventoryMutation_` and `findEffectiveQtyPer_` ported, and all three write paths rewired through one atomic commit (AUDIT B3). Before this, `buildHardAssembly` deleted the consumed components in one call and minted the assembly in a later one — a failure in between **destroyed stock**; `explodeAssembly` was the mirror image and **doubled** it. Parity harness compares the emitted Sheets operations, not the return value. |
-| `Service_PO_Ingest` | **~60%** | Parser ported; **`extractTextFromPdfBlob` (the actual pdf-parse call) missing**, supplier email missing. |
+| `Service_PO_Ingest` | ~~**~60%**~~ **~95% (Phase 4F)** | ~~`extractTextFromPdfBlob` missing~~ — **that claim was wrong**: the capability is inlined into `processUploadedPOFile`, which calls `pdfParse(buffer)`. There IS a real gap underneath it, and a more interesting one: SRC does not read the PDF's text layer at all, it round-trips the file through Google Drive with `{ocr:true}`. That reads a **scanned** PO; `pdf-parse` only extracts an existing text layer. A QuickBooks-generated PO parses identically; a scanned one the original could read, this cannot — it refuses honestly rather than parsing to nothing. Closing it needs a new dependency or Google service, so it **needs a decision**. `emailPOPdfToSupplier` ported (4F). |
 | `Service_RXO` | **~80%** | Cleanest port. Missing config-status + diagnostics harness helpers. |
 | `Service_Validate` | **~85%** | Ported; board-id check against env still a comment. |
-| `Service_Diagnostics` / `Service_Email` | Ported / new | Email is a fresh nodemailer wrapper (no original). |
-| HTTP routes | ~~**~5%**~~ **Done (Phase 3)** | `functions/http/` — 71 routes, all 64 SRC client calls covered, common `runMutation` wrapper, 82-check contract test (`npm run test:routes`). ~~10~~ **8** routes answer **501** naming the unported service behind them — `estimateShipByDateV2` went live in Phase 4B and `explodePartialHub` in 4E. |
+| `Service_Diagnostics` / `Service_Email` | Ported / new, **`Service_Email` fixed (4F)** | Email is a fresh nodemailer wrapper (no original). It hardcoded `smtp.ethereal.email` with a literal placeholder password and read **none** of the five SMTP_* keys Phase 1 declared, so every outbound message failed. Now built from config, lazily, failing soft when unconfigured. |
+| HTTP routes | ~~**~5%**~~ **Done (Phase 3)** | `functions/http/` — 71 routes, all 64 SRC client calls covered, common `runMutation` wrapper, 82-check contract test (`npm run test:routes`). ~~10~~ **7** routes answer **501** naming the unported service behind them — `estimateShipByDateV2` went live in 4B, `explodePartialHub` in 4E and `emailPOPdfToSupplier` in 4F. All seven remaining wait on a whole unported FILE, not a missing function. |
 | Not ported at all | — | ~~`Shared_Classifiers`~~ **(ported, Phase 2)**, `Webhook_Receiver`, `syncAllBoardsToShipmentsTab`, `evaluateRollupStatuses`, `pushOutboundToShippingSchedule`, `Service_Router`, `Fedex_Master_Script`, HTS tools. |
 | Frontend views | **~10%** | Shell + 14 map SVGs converted. All views are placeholder/dummy-data. Client engine (`JS_Handlers` 337KB, `JS_Render_UI` 145KB) not ported. |
 

@@ -116,7 +116,7 @@ const CONTRACT = {
   // --- PO ingest
   processUploadedPOFile: 'POST /po-ingest',
   reresolvePOForVendor: 'POST /po-ingest/reresolve',
-  emailPOPdfToSupplier: 'POST /po-ingest/email-supplier', // 501
+  emailPOPdfToSupplier: 'POST /po-ingest/email-supplier',
 
   // --- shipping dates / FedEx
   updateShipmentReadiness: 'POST /shipment',

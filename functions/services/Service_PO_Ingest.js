@@ -1,6 +1,7 @@
 const { logger } = require('firebase-functions');
 const pdfParse = require('pdf-parse');
 const { getProductMap, getBrandItemCatalog, getCustomerRegistry } = require('./Service_Read');
+const { sendWithAttachments } = require('./Service_Email');
 
 async function processUploadedPOFile(payload) {
   try {
@@ -244,7 +245,65 @@ function matchCatalogSKU(partNumber, catalog) {
   return null;
 }
 
+/**
+ * Emails the original uploaded PO PDF to a supplier (and an optional CC), from
+ * the Trello Injector's "Ingest PO PDF" flow.
+ *
+ * This exists because these POs are generated in QuickBooks and then have to be
+ * separately, manually emailed to the supplier -- an easy step to forget or to
+ * duplicate, since nothing otherwise ties "sent to Trello" together with
+ * "actually emailed to the supplier". Optional and non-blocking: it is only
+ * ever called from the prompt shown AFTER a successful Trello send, and is
+ * never required to complete that send.
+ *
+ * SRC builds a Blob with `Utilities.newBlob` and hands it to
+ * `MailApp.sendEmail(..., {attachments:[blob]})`. Here the base64 is decoded to
+ * a Buffer and passed to nodemailer, which takes the same three fields
+ * (filename, content, contentType).
+ *
+ * Parity with SRC/src/Service_PO_Ingest.js:350-375.
+ *
+ * @param {{base64Data: string, fileName?: string, poNumber?: string,
+ *          toEmail: string, ccEmail?: string}} payload
+ * @return {Promise<{success: boolean, message?: string}>}
+ */
+async function emailPOPdfToSupplier(payload) {
+  try {
+    if (!payload || !payload.base64Data) {
+      return { success: false, message: 'No PDF data available to email.' };
+    }
+    const toEmail = String(payload.toEmail || '').trim();
+    if (!toEmail) {
+      return { success: false, message: 'No recipient email provided.' };
+    }
+
+    const content = Buffer.from(payload.base64Data, 'base64');
+    if (content.length === 0) {
+      return { success: false, message: 'The PDF attachment decoded to nothing.' };
+    }
+
+    const subject = 'Purchase Order' + (payload.poNumber ? ' #' + payload.poNumber : '');
+    const ccEmail = String(payload.ccEmail || '').trim();
+
+    return await sendWithAttachments({
+      to: toEmail,
+      cc: ccEmail || undefined,
+      subject: subject,
+      text: 'Please see the attached Purchase Order PDF.',
+      attachments: [{
+        filename: payload.fileName || 'PO.pdf',
+        content: content,
+        contentType: 'application/pdf'
+      }]
+    }, 'PO PDF to supplier');
+  } catch (e) {
+    return { success: false, message: 'Failed to send email: ' + e.message };
+  }
+}
+
 module.exports = {
   processUploadedPOFile,
-  reresolvePOForVendor
+  reresolvePOForVendor,
+  emailPOPdfToSupplier
 };
+

@@ -2,10 +2,11 @@
 
 **Date:** 2026-08-28
 **Baseline:** `371ac57` (end of Phase 3)
-**Scope:** five units. Unit A is the write-path lock (AUDIT B7). Unit B is
-`Service_Dates` parity. Unit C locks the three move paths SRC leaves open.
-Unit D is `Service_Conversions` parity, plus four aging-anchor bugs it uncovered.
-Unit E is `Service_Assembly` parity and `SS_API.commitAtomic` (AUDIT B3).
+**Scope:** six units. A: the write-path lock (AUDIT B7). B: `Service_Dates`
+parity. C: locking the three move paths SRC leaves open. D: `Service_Conversions`
+parity, plus four aging-anchor bugs it uncovered. E: `Service_Assembly` parity
+and `SS_API.commitAtomic` (AUDIT B3). F: outbound email, and a correction to the
+audit.
 
 ---
 
@@ -1093,3 +1094,122 @@ count changing is not a surprise.
 - **`Service_PO_Ingest`** is missing `extractTextFromPdfBlob` — the actual
   `pdf-parse` invocation — so PO ingest cannot read a PDF at all.
 - **`cleanUpVacantRows` is still unlocked** (flagged in Unit C, unchanged).
+
+---
+
+# UNIT F — outbound email, and a correction to the audit
+
+Small unit, but it closes the last service-level 501 that was not waiting on a
+whole unported file.
+
+## 1. `Service_Email` was ignoring its own configuration
+
+Phase 1 declared five config keys — `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`,
+`SMTP_PASS`, `SMTP_FROM` — documented them in `.env.example`, and listed two of
+them as `secret: true`.
+
+**Nothing read any of them.** `Service_Email.js` hardcoded:
+
+```js
+host: 'smtp.ethereal.email',
+auth: { user: 'ethereal.user@ethereal.email', pass: 'ethereal_password' }
+```
+
+So every outbound message authenticated against a throwaway test service with a
+literal placeholder password, and failed. `grep -rn "SMTP_" services/` returned
+nothing outside `config.js`.
+
+Rewritten to build the transport from config, **lazily and once** — building it
+at module load would run during Cloud Functions' deploy-time analysis pass and
+at every cold start, including for the many requests that never send mail.
+
+`secure` is derived from the port rather than hardcoded (465 is implicit TLS;
+587 and 25 negotiate STARTTLS after connecting), and auth is omitted entirely
+when neither user nor pass is set, for a relay that does not want it.
+
+**An unconfigured `SMTP_HOST` returns a reason, it does not throw.** Every use of
+mail in this system is a best-effort side channel — a receipt notification, a PO
+copy to a supplier — and none of them should take down the operation the
+operator is actually waiting on.
+
+## 2. `emailPOPdfToSupplier` ported
+
+`POST /po-ingest/email-supplier` was a 501. It now works.
+
+SRC builds a Blob with `Utilities.newBlob` and hands it to
+`MailApp.sendEmail(..., {attachments:[blob]})`. Here the base64 is decoded to a
+Buffer and passed to nodemailer, which takes the same three fields (filename,
+content, contentType).
+
+Kept deliberately soft, because SRC's comment is explicit about why it exists:
+these POs are generated in QuickBooks and then have to be *separately, manually*
+emailed to the supplier — easy to forget or to duplicate. It is only ever
+reached from the prompt shown **after** a successful Trello send and must never
+be required to complete one. So an unconfigured SMTP host comes back as a 422
+saying exactly that, rather than as a crash.
+
+## 3. A correction to `PORT_AUDIT.md`
+
+The audit said:
+
+> `Service_PO_Ingest` — **`extractTextFromPdfBlob` (the actual pdf-parse call)
+> missing**
+
+**That is wrong, and I wrote it.** The capability is present — it is inlined
+into `processUploadedPOFile`, which decodes the base64 to a Buffer and calls
+`pdfParse(buffer)`. There is no separate function by that name, which is what
+the mechanical function-name diff picked up.
+
+**But there is a real gap underneath it, and it is more interesting than the one
+the audit claimed.** SRC's `extractTextFromPdfBlob` does not read the PDF's text
+layer at all — it uploads the file to Google Drive with `{ocr: true}`, opens the
+resulting Doc, and reads that:
+
+```js
+var docFile = Drive.Files.insert(fileResource, pdfBlob, { ocr: true });
+var doc = DocumentApp.openById(docFile.id);
+var text = doc.getBody().getText();
+```
+
+That is **OCR**. It reads a *scanned* PO — a photograph or a fax of a printed
+page, with no embedded text at all. `pdf-parse` only extracts an existing text
+layer; handed a scanned page it returns nothing.
+
+So: a QuickBooks-generated PO (which has a real text layer) parses identically
+on both sides. A **scanned** PO that the original could read, this port cannot.
+It fails honestly — *"Could not extract readable text from PDF."* — rather than
+silently producing an empty parse, which is the right failure mode. But it is a
+capability the original has and this does not.
+
+Closing it needs a decision from you, because every option is a new dependency
+or a new Google service: Cloud Vision API, a Drive API round-trip mirroring
+SRC's, or a bundled OCR engine. **Not doing that unilaterally** — flagged in
+`PORT_AUDIT.md` and left for you.
+
+## 4. Verification
+
+| Check | Result |
+|---|---|
+| `npm run lint` | ✅ exit 0, 7 warnings (unchanged from Unit E) |
+| `npm run test:parity` (six harnesses) | ✅ 0 differences |
+| `npm run test:routes` | ✅ 82 checks, 0 failures — the CONTRACT map now records `emailPOPdfToSupplier` as live |
+| `npm run test:lock` | ✅ 27 checks, 0 failures |
+| `firebase emulators:exec --only functions` | ✅ clean boot, exit 0 |
+
+No parity harness for this one, and that is deliberate rather than an omission:
+the only thing to compare is "did it call the mailer with the right arguments",
+which is a test of a mock. The argument construction is a dozen lines and was
+reviewed line-by-line against SRC.
+
+**501 routes: 8 → 7**, and every one of the seven is now waiting on a whole
+unported file rather than on a missing function:
+
+| Waiting on | Routes |
+|---|---|
+| `Fedex_Master_Script.js` | `batchCalculateTransitTimes`, `getEstimatorOriginZip`, `getEstimatorRtfOriginZip` |
+| the unported half of `Service_RXO.js` | `getRxoConfigStatus`, `rxoRunDiagnostics`, `rxoTestShipmentLookup` |
+| `updateHtsDataSheet.js` | `syncLocalHtsCacheWithGovernment` |
+
+The RXO split is worth remembering: the ported half and the half the client
+actually calls are **disjoint** — `RXO_Test.html` calls none of the three live
+lookups that are ported. See `PHASE_3_NOTES.md` §3.

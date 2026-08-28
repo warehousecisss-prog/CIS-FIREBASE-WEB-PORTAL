@@ -10,7 +10,7 @@
 const express = require('express');
 
 const Service_PO_Ingest = require('../../services/Service_PO_Ingest');
-const {runMutation, notImplemented} = require('../wrappers');
+const {runMutation} = require('../wrappers');
 
 const router = express.Router();
 
@@ -32,8 +32,14 @@ router.post('/po-ingest/reresolve', runMutation('Re-resolve PO for vendor', (req
 
 // SRC: TrelloInjector.html:834
 //   `.emailPOPdfToSupplier({base64Data, fileName, poNumber, toEmail, ccEmail})`.
-router.post('/po-ingest/email-supplier', notImplemented(
-    'emailPOPdfToSupplier',
-    'Service_PO_Ingest parity -- emailPOPdfToSupplier is unported (PORT_AUDIT.md). Service_Email.sendPONotification is a different, port-only nodemailer wrapper and is NOT a drop-in substitute'));
+//
+// Answered 501 until Phase 4 Unit F. Deliberately still a soft failure: SRC's
+// comment is explicit that this is only ever reached from the prompt shown
+// AFTER a successful Trello send and must never be required to complete one.
+// An unconfigured SMTP host therefore comes back as a 422 saying so, not as a
+// crash -- see Service_Email.getTransport().
+router.post('/po-ingest/email-supplier', runMutation('Email PO PDF to supplier', (req) => {
+  return Service_PO_Ingest.emailPOPdfToSupplier(req.body);
+}));
 
 module.exports = router;
