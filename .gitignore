@@ -22,6 +22,11 @@ functions/.env
 functions/service-account*.json
 serviceAccountKey.json
 
+# ...but the dummy-valued template IS tracked. It documents every config key,
+# so it has to survive the .env.* rule above.
+!.env.example
+!functions/.env.example
+
 # Original Apps Script project — kept locally as reference, versioned in its own repo.
 # The porting contract is vendored into reference/ instead.
 /SRC/
