@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+functions/node_modules/
+frontend/node_modules/
+
+# Build output
+frontend/dist/
+frontend/dist/**
+
+# Firebase
+.firebase/
+firebase-debug.log
+firebase-debug.*.log
+*-debug.log
+.firebaserc.local
+
+# Env / secrets
+.env
+.env.*
+*.local
+functions/.env
+functions/service-account*.json
+serviceAccountKey.json
+
+# Original Apps Script project — kept locally as reference, versioned in its own repo.
+# The porting contract is vendored into reference/ instead.
+/SRC/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
