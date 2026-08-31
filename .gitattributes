@@ -16,6 +16,14 @@
 # mistake cannot reach a commit again no matter which tool made it.
 * text=auto eol=lf
 
+# EXCEPT reference/, which is VENDORED FROM UPSTREAM and must stay byte-identical
+# to what was copied in. SCHEMA.md is the operational contract for the original
+# app and CHANGELOG.md is its history; both arrived CRLF. Normalising them would
+# rewrite every line of a document this port is supposed to diff against, and the
+# porting rules say not to edit reference/ here at all. `-text` disables all
+# line-ending conversion for them.
+reference/** -text
+
 # Binary: never touch these.
 *.png binary
 *.jpg binary
