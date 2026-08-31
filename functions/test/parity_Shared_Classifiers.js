@@ -67,6 +67,25 @@ const sandbox = {
 vm.createContext(sandbox);
 vm.runInContext(fs.readFileSync(srcPath, 'utf8'), sandbox, {filename: srcPath});
 
+// Four pure SHIPMENTS-row helpers moved into the port's Shared_Classifiers
+// (Phase 5, step 1) still live in these two SRC files. Load them into the same
+// sandbox so they can be compared here alongside everything else this module
+// owns. Both files are top-level `function` declarations only -- nothing
+// executes at load, and the globals their bodies reach for
+// (isKnownBrandLabel_, isCardIgnored_, PORTAL_IGNORED_MARKER) are already
+// defined by the Shared_Classifiers load above.
+[
+  'SRC/src/syncAllBoardsToShipmentsTab.js', // formatOutboundLineItems,
+                                            // harvestFedExTrackingNumber,
+                                            // extractStoreInfo
+  'SRC/src/evaluateRollupStatuses.js'       // cleanTrackingNumber
+].forEach((rel) => {
+  const p = path.join(ROOT, rel);
+  if (fs.existsSync(p)) {
+    vm.runInContext(fs.readFileSync(p, 'utf8'), sandbox, {filename: p});
+  }
+});
+
 // ---- load the port --------------------------------------------------------
 process.env.INBOUND_PO_BOARD_ID = BOARD_DEFAULTS.INBOUND_PO_BOARD_ID;
 const port = require(portPath);
@@ -218,6 +237,70 @@ cmp('getBoardMatrix_', sandbox.getBoardMatrix_, port.getBoardMatrix_, [[]]);
 cmp('resolveBoardById_', sandbox.resolveBoardById_, port.resolveBoardById_,
     one([null, '', '649c805bad63086ff6689611', '66bcf93dd63eecdb2d4e91e7', 'unknown-board', '  649c7dd6690130fe8ef3689a  ']));
 
+// ---- Phase 5 step 1: the four pure SHIPMENTS-row helpers ------------------
+const OUTBOUND_BOARDS = [
+  'Shipping Schedule', 'Burlington Shipping Schedule',
+  'Nicole POs', 'Purchase Orders', '', null
+];
+
+const OUTBOUND_LABEL_SETS = [
+  null, [], [{name: 'Scorpion'}], [{name: 'v32'}, {name: '48 AM'}],
+  [{name: 'BRAND: AEO'}], [{name: 'CLIENT: TJX'}], [{name: 'PORTAL: IGNORE'}],
+  [{name: 'Timing Tech'}], [{name: 'SEA SHIP'}], [{name: 'TJX INVENTORY'}],
+  [{name: 'BURLINGTON'}], [{name: 'Milli'}, {name: 'PORTAL: IGNORE'}],
+  [{name: ''}], [{}]
+];
+
+const OUTBOUND_DESCS = [
+  '', null,
+  '• 500 RF Labels\n• 200 Hang Tags',
+  '- 500 RF Labels — 3\n* Milli x2\n• Cable Tether',
+  'Store: Multi\nScheduled Date: 08/10/2026\n• Widget A\nqty: 5 cases',
+  'Total Cases: 4\nTotal Cases 9\nqty: 5 boxes',
+  'QTY: 12 Scorpion\n” 3 inch cable\n--- SHIPMENT LINE ITEMS ---',
+  'plain paragraph with no markers at all',
+  'CASE pack note\n• Item — Qty: 500 [20 cs]'
+];
+
+// A focused, non-cartesian set: each board branch exercised with labels-only,
+// desc-only, both, neither, and an ignored card, against a real registry and
+// an empty one.
+const outboundArgs = [];
+OUTBOUND_BOARDS.forEach((b) => {
+  OUTBOUND_LABEL_SETS.forEach((labels) => {
+    OUTBOUND_DESCS.forEach((desc) => {
+      outboundArgs.push([b, labels, desc, REGISTRY]);
+      outboundArgs.push([b, labels, desc, []]);
+    });
+  });
+});
+cmp('formatOutboundLineItems', sandbox.formatOutboundLineItems,
+    port.formatOutboundLineItems, outboundArgs);
+
+const HARVEST_TEXTS = [
+  '', null, 'no digits at all', 'Tracking 794644790553',
+  '123456789012345', 'ref 12-3456-7890-12 done',
+  'two 794644790553 and 999888777666', 'short 12345',
+  '888 999888777666555000', 'FedEx: 7946 4479 0553', 61285000000012
+];
+cmp('harvestFedExTrackingNumber', sandbox.harvestFedExTrackingNumber,
+    port.harvestFedExTrackingNumber, pairs(HARVEST_TEXTS, ['', 'see comment 999888777666']));
+
+const STORE_ENTITIES = [
+  '', null, 'MAR 1670', 'Burlington Store #1234', 'Store 12', 'AEO Store 3811',
+  'NoNumbersHere', 'ABC#99999', '  MAR   1670  extra', '123', 'A 1',
+  'X'.repeat(40) + ' 55', 'Nordstrom Rack 4321 West'
+];
+cmp('extractStoreInfo', sandbox.extractStoreInfo, port.extractStoreInfo,
+    one(STORE_ENTITIES));
+
+const TRACKING_VALS = [
+  null, undefined, '', '794644790553', '794644790553.0', '875021925761.00',
+  875021925761.0, '  123-456  ', 'abc', 0, false, '7.94e11', '000123'
+];
+cmp('cleanTrackingNumber', sandbox.cleanTrackingNumber, port.cleanTrackingNumber,
+    one(TRACKING_VALS));
+
 // ---- second round: with the PRODUCT identity index POPULATED ---------------
 // This is the case the port had to restructure for: SRC reads the PRODUCT sheet
 // synchronously inside productIdentityKey_, the port cannot, so the load is
@@ -263,7 +346,7 @@ port.primeQbNameIndex(true).then(() => {
 
 function report() {
 
-console.log(`\nran ${checks} comparisons across 19 functions`);
+console.log(`\nran ${checks} comparisons across 23 functions`);
 if (failures.length === 0) {
   console.log('PARITY OK — every output identical to SRC\n');
 } else {

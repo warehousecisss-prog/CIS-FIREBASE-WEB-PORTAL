@@ -394,6 +394,148 @@ function formatInboundLineItems(checklists, labels) {
 }
 
 /**
+ * Builds the SHIPMENTS summary column for an OUTBOUND card. The inbound
+ * counterpart is formatInboundLineItems() above; both are here for the same
+ * reason -- the scheduled sync (syncAllBoardsToShipmentsTab.js) and the
+ * real-time webhook (Webhook_Receiver.js) each need it, and keeping one copy
+ * stops the two paths drifting apart the way the inbound copies did before
+ * 2026-08-24 (AUDIT_2026-08-24.md C1).
+ *
+ * Three board-specific extraction rules, ported verbatim from SRC:
+ *  - "Shipping Schedule": prefer labels (minus metadata/known-brand labels),
+ *    fall back to bulleted / qty|case description lines.
+ *  - "Burlington Shipping Schedule": prefer description bullets (incl. "-"/"*"
+ *    markdown bullets and a "smart-quote inches" marker), fall back to labels.
+ *  - anything else: description bullets / qty|case lines only.
+ *
+ * DIVERGENCE FROM SRC (registry default): SRC fills an omitted `registry`
+ * argument from a synchronous global getCustomerRegistry(). Only the retired
+ * legacyProcessWebhookPayload_() ever omitted it. The port has no synchronous
+ * registry source -- getCustomerRegistry() is async and in Service_Read -- so
+ * an omitted registry here just means "no brand labels to recognise". Every
+ * live caller passes a pre-fetched registry, exactly like
+ * classifyInboundOrderOriginServer_() / isKnownBrandLabel_() already require.
+ * The parity harness always supplies one, so the divergence is confined to the
+ * omitted-argument case and never exercised on a real path.
+ *
+ * @param {string} boardName
+ * @param {Array<{name: string}>} labels
+ * @param {string} descText
+ * @param {Array<Object>} [registry] CUSTOMER_REGISTRY export; defaults to [].
+ * @return {string}
+ */
+function formatOutboundLineItems(boardName, labels, descText, registry) {
+  if (registry === undefined) registry = [];
+
+  const lines = [];
+  lines.push('--- SHIPMENT LINE ITEMS ---');
+  if (boardName === 'Shipping Schedule') {
+    if (labels && labels.length > 0) {
+      labels.forEach((l) => {
+        const name = String(l.name || '').trim();
+        const upper = name.toUpperCase();
+        if (name && !upper.startsWith('BRAND:') && !upper.startsWith('CLIENT:') && !upper.startsWith('PORTAL:') && !upper.includes('TIMING TECH') && !upper.includes('SEA SHIP') && !upper.includes('TJX INVENTORY') && !isKnownBrandLabel_(name, registry)) {
+          lines.push(` • ${name}`);
+        }
+      });
+    } else if (descText) {
+      descText.split('\n').forEach((line) => {
+        const trimmed = line.trim();
+        if ((trimmed.startsWith('•') || /qty|case/i.test(trimmed)) && !/total cases/i.test(trimmed)) {
+          lines.push(` • ${trimmed.replace(/^[•\-\*\s]+/, '')}`);
+        }
+      });
+    }
+  } else if (boardName === 'Burlington Shipping Schedule') {
+    const descBullets = [];
+    if (descText) {
+      descText.split('\n').forEach((line) => {
+        const trimmed = line.trim();
+        if ((trimmed.startsWith('•') || trimmed.startsWith('-') || trimmed.startsWith('*') || /qty:|”/i.test(trimmed)) && !/total cases|scheduled date|store:|shipment line items/i.test(trimmed)) {
+          descBullets.push(` • ${trimmed.replace(/^[•\-\*\s]+/, '')}`);
+        }
+      });
+    }
+
+    if (descBullets.length > 0) {
+      lines.push(...descBullets);
+    } else if (labels && labels.length > 0) {
+      labels.forEach((l) => {
+        const name = String(l.name || '').trim();
+        const upper = name.toUpperCase();
+        if (name && !upper.startsWith('BRAND:') && !upper.startsWith('CLIENT:') && !upper.startsWith('PORTAL:') && !upper.includes('TIMING TECH') && !upper.includes('SEA SHIP') && !upper.includes('TJX INVENTORY') && !isKnownBrandLabel_(name, registry)) {
+          lines.push(` • ${name}`);
+        }
+      });
+    }
+  } else {
+    if (descText) {
+      descText.split('\n').forEach((l) => {
+        const t = l.trim();
+        if (t && (t.startsWith('•') || t.startsWith('-') || t.startsWith('*') || /qty|case/i.test(t)) && !/total cases|scheduled date|store:|shipment line items/i.test(t)) {
+          lines.push(` • ${t.replace(/^[•\-\*\s]+/, '')}`);
+        }
+      });
+    }
+  }
+
+  const result = lines.length > 1 ? lines.join('\n') : 'No specific shipping line items listed.';
+
+  return isCardIgnored_(labels) ? PORTAL_IGNORED_MARKER + '\n' + result : result;
+}
+
+/**
+ * Pulls the first FedEx-shaped tracking number (a 12- or 15-digit run) out of
+ * a card's description + comment text. Non-digits are collapsed to spaces
+ * first, so a hyphen- or space-grouped number still matches. Returns '' when
+ * there is none. Ported verbatim from syncAllBoardsToShipmentsTab.js -- the
+ * scheduled sync and the webhook both harvest tracking this way.
+ *
+ * @param {string} descText
+ * @param {string} commentText
+ * @return {string}
+ */
+function harvestFedExTrackingNumber(descText, commentText) {
+  const fullText = (descText + ' ' + commentText).replace(/[^0-9]/g, ' ');
+  const matches = fullText.match(/\b(\d{12}|\d{15})\b/g);
+  return matches ? matches[0] : '';
+}
+
+/**
+ * Splits an entity/store string like "MAR 1670" or "Burlington Store #1234"
+ * into {storeName, storeNum}. Falls back to {storeName: first 30 chars,
+ * storeNum: 'N/A'} when there is no trailing 2-6 digit store number. Ported
+ * verbatim from syncAllBoardsToShipmentsTab.js; feeds the "Multi Piece
+ * Tracking" store columns.
+ *
+ * @param {string} entityName
+ * @return {{storeName: string, storeNum: string}}
+ */
+function extractStoreInfo(entityName) {
+  const cleaned = String(entityName || '').trim();
+  const storeMatch = cleaned.match(/^([A-Za-z\s]+)\s*#?\s*(\d{2,6})/);
+  if (storeMatch) {
+    return {storeName: storeMatch[1].trim(), storeNum: storeMatch[2].trim()};
+  }
+  return {storeName: cleaned.substring(0, 30), storeNum: 'N/A'};
+}
+
+/**
+ * Strips a tracking number down to digits only, dropping a trailing ".0" /
+ * ".00" first (Sheets imports a bare number as a float). Empty/null/'' -> ''.
+ * Ported verbatim from evaluateRollupStatuses.js, where it keys the master ->
+ * child-box status map.
+ *
+ * @param {*} val
+ * @return {string}
+ */
+function cleanTrackingNumber(val) {
+  if (val === null || val === undefined || val === '') return '';
+  const str = String(val).trim();
+  return str.replace(/\.0+$/, '').replace(/[^0-9]/g, '');
+}
+
+/**
  * Comment-driven trigger for the ".ignore" feature above. This does NOT replace
  * the label as the storage mechanism -- isCardIgnored_() and everything
  * downstream of it still only ever looks at the label, so every sync/webhook
@@ -1089,6 +1231,10 @@ module.exports = {
   PORTAL_IGNORED_MARKER,
   isCardIgnored_,
   formatInboundLineItems,
+  formatOutboundLineItems,
+  harvestFedExTrackingNumber,
+  extractStoreInfo,
+  cleanTrackingNumber,
   parseIgnoreComment_,
   applyIgnoreDeclaration_,
   backfillIgnoreCommentsFromComments_,

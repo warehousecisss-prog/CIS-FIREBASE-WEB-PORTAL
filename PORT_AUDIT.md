@@ -44,6 +44,16 @@
 > frontend. Seven routes still answer 501 — three FedEx, three RXO, one HTS —
 > and every one waits on a whole unported file rather than a missing function.
 
+> **Status update 2026-08-31 — Phase 5 started (`PHASE_5_NOTES.md`).** The
+> sync/webhook body of work. Deploy-topology decisions taken up front (drop the
+> Render proxy, widen the sync self-timeout, Firestore-backed webhook
+> de-bounce, external AEO/Burlington sheets shared with the service account).
+> **Step 1 done:** four pure SHIPMENTS-row helpers (`formatOutboundLineItems`,
+> `harvestFedExTrackingNumber`, `extractStoreInfo`, `cleanTrackingNumber`)
+> ported verbatim into `Shared_Classifiers.js`; `parity_Shared_Classifiers.js`
+> extended to 3052 comparisons across 23 functions, mutation-tested. Nothing
+> wired to a caller yet — these land ahead of the engines (steps 2–5).
+
 > Purpose: an honest map of what is actually ported, what is stubbed, and what
 > hasn't been started — so the remaining work can be sequenced. The existing
 > `MIGRATION_CHANGELOG.md` marks every backend service `[DONE]`; that is
