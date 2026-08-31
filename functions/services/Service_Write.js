@@ -1244,6 +1244,32 @@ async function markFedExChildDeliveredInSheet(tracking) {
       if (updates.length > 0) await SS_API.batchUpdateValues(updates);
     }
 
+    // Keep the SHIPMENTS rollup column and dashboard cache in sync right away,
+    // instead of waiting for the next scheduled cycle. Both calls exist in SRC
+    // (Service_Write.js:1802-1803) and were missing here until Phase 5 --
+    // evaluateRollupStatuses had no port to call. Without them, an operator who
+    // manually marks a child box delivered sees the box update but NO change to
+    // the shipment's status badge or the dashboard until the next scheduled
+    // sync, which is exactly the "I pressed it and nothing happened" symptom
+    // AUDIT A1 is about.
+    //
+    // Required lazily, and deliberately: Service_Rollup requires Service_Write's
+    // sibling modules, and a top-level import here would close a cycle.
+    // Failures are logged, not propagated -- the box status IS written by this
+    // point, and reporting failure would misrepresent that.
+    try {
+      await require('./Service_Rollup').evaluateRollupStatuses();
+    } catch (rollupErr) {
+      logger.warn('markFedExChildDeliveredInSheet: rollup refresh failed -- the box ' +
+                  'status was written, the badge will catch up on the next sync. ' +
+                  rollupErr.message);
+    }
+    try {
+      await require('./Service_Read').warmLogisticsDashboardCache();
+    } catch (warmErr) {
+      logger.warn('markFedExChildDeliveredInSheet: cache warm failed -- ' + warmErr.message);
+    }
+
     return { success: true };
   } catch (e) {
     return { success: false, error: e.toString() };

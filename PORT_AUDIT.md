@@ -53,6 +53,16 @@
 > ported verbatim into `Shared_Classifiers.js`; `parity_Shared_Classifiers.js`
 > extended to 3052 comparisons across 23 functions, mutation-tested. Nothing
 > wired to a caller yet — these land ahead of the engines (steps 2–5).
+> **Step 2 done:** `evaluateRollupStatuses` → `functions/services/Service_Rollup.js`
+> (SCHEMA §7, the rollup state machine). Decision tree extracted as a pure
+> `evaluateRollupRow_`; 455-comparison harness that diffs the emitted status
+> writes / Trello calls / emails, mutation-tested against **ten** properties.
+> Found and fixed **a real bug the verbatim port would have shipped** — the
+> Sheets API omits trailing empty cells where Apps Script pads them, so every
+> statusless shipment would have had the literal text `undefined` written into
+> column J (see `padRows_`). Also closed a previously-unrecorded gap in
+> `markFedExChildDeliveredInSheet`, which was missing SRC's post-write rollup
+> refresh + cache warm. Not client-callable, so no route.
 
 > Purpose: an honest map of what is actually ported, what is stubbed, and what
 > hasn't been started — so the remaining work can be sequenced. The existing
@@ -248,7 +258,7 @@ SRC, on the same reasoning as the move paths in Unit C.
 | ~~`Shared_Classifiers.js`~~ | 44KB | **PORTED (Phase 2)** to `functions/services/Shared_Classifiers.js`, with a parity harness (`npm run test:parity`, 1492 comparisons). `backfillIgnoreCommentsFromComments_` landed in Phase 4B, once `fetchCardComments_` existed to unblock it. A client-side duplicate is still needed. |
 | `Webhook_Receiver.js` | 33KB | Real-time Trello card-update webhook | `onRequest` function |
 | `syncAllBoardsToShipmentsTab.js` | 35KB | Scheduled full board→SHIPMENTS pull | `onSchedule` (currently a no-op `scheduledSync`) |
-| `evaluateRollupStatuses.js` | 20KB | Rollup status state machine | service module, called by sync |
+| ~~`evaluateRollupStatuses.js`~~ | 20KB | **PORTED (Phase 5, step 2)** to `functions/services/Service_Rollup.js`, with a 455-comparison harness (`npm run test:parity:rollup`) that diffs emitted status writes, Trello calls and emails, mutation-tested against 10 properties. Two deliberate divergences (stakeholder-email fallback, no lock) both documented and asserted. `migrateRollupStatusLabels` ported but untested (manual one-off). |
 | `pushOutboundToShippingSchedule.js` | 35KB | AEO/Burlington external-sheet → Trello push | `onSchedule` |
 | `Service_Router.js` | 12KB | Webhook routing | folds into `Webhook_Receiver` |
 | `Fedex_Master_Script.js` | 31KB | FedEx MPS discovery/tracking | service module |

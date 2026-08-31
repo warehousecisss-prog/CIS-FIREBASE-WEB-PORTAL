@@ -128,6 +128,25 @@ async function sendWithAttachments(message, label) {
   return send_(message, label || 'attachment mail');
 }
 
+/**
+ * Sends one arbitrary message. The general-purpose entry point, for callers
+ * whose Apps Script original is a bare `MailApp.sendEmail({to, subject,
+ * htmlBody})` with no attachment and no PO payload -- Service_Rollup's
+ * delivered-in-full notification, for one.
+ *
+ * `sendWithAttachments` above is the same passthrough under a narrower name;
+ * both exist so a call site reads as what it actually does rather than
+ * borrowing a misleading one.
+ *
+ * @param {{to: string, cc?: string, subject: string, text?: string,
+ *          html?: string, attachments?: Array<Object>}} message
+ * @param {string} [label]
+ * @return {Promise<Object>}
+ */
+async function sendMail(message, label) {
+  return send_(message, label || 'mail');
+}
+
 /** Test seam: drop the cached transport so config changes take effect. */
 function __resetTransportForTests() {
   transporter = null;
@@ -137,5 +156,6 @@ function __resetTransportForTests() {
 module.exports = {
   sendPONotification,
   sendWithAttachments,
+  sendMail,
   __resetTransportForTests
 };
