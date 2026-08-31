@@ -568,3 +568,138 @@ webhook harness exercises which *branch* they drive, not whether they parse
 correctly. Worth adding to the Service_Dates harness — they are pure and
 trivially comparable — flagged rather than done here to keep this step's diff
 about the webhook.
+
+---
+
+## Step 4 — `syncAllBoardsToShipmentsTab`, the scheduled sync (DONE)
+
+`functions/services/Service_Sync.js`, plus `exports.scheduledSync` in
+`index.js` — which until now was a one-line stub that logged and did nothing.
+
+This is the conductor. Every cycle it pulls all four Trello boards, rewrites
+SHIPMENTS from what it finds, and then runs the rest of the pipeline in a fixed
+order: rollup engine → archive → prune → missed-override detection → READY/PORT
+backfill → date-state refresh → cache warm. Steps 2 and 3 built the pieces;
+this is what runs them.
+
+### A REAL BUG IN THE ORIGINAL — found, fixed, and demonstrated
+
+**Failure scenario in one sentence:** the moment one shipment is archived,
+every shipment below it on the sheet inherits **a different shipment's ETA and
+readiness data**, and it compounds with each archived row.
+
+SHIPMENTS is **eighteen** columns wide (A–R). Columns K–R are the entire
+Readiness/ETA state machine `Service_Dates` maintains: ready-to-ship date and
+basis, ETA date and basis, date state, port of arrival, last auto-pushed due
+date, ETA-overridden flag.
+
+SRC removes finished rows by **rewriting columns A–J**: read A–J, filter out
+the doomed rows, clear A–J, write the compacted list back into A–J. Identical
+code in `archiveCompletedShipments` (`:538-544`) and
+`pruneDeletedShipmentCards_` (`:724-731`). Columns K–R are never touched, so
+the A–J data slides up a row and the K–R data does not.
+
+The original is aware of the hazard in the abstract — `isCardIgnored_`'s
+comment in `Shared_Classifiers.js` says this path "only rewrites columns A-J,
+which would desync every row below it from its own K-R readiness/ETA data", and
+declines to *reuse* it for the ignore feature. It was left running on the
+archive and prune paths, which run every cycle.
+
+**Fixed by deleting whole rows** (`deleteShipmentRows_` → `deleteDimension`).
+Sheets moves all eighteen columns together, so nothing can desync; it is also
+one API call instead of a clear plus a write.
+
+The harness *demonstrates* it rather than asserting it — SRC failing this **is**
+the bug, not a regression — by stamping a per-row tag into K/P/Q and printing
+the alignment after archiving 4 of 10 shipments:
+
+```
+--- readiness/ETA alignment after archiving 4 of 10 shipments ---
+  SRC  (A-J compaction) : 0 intact, 6 carrying ANOTHER shipment's ETA data
+      s-keep-inb   (has K1-RTS, should have K4-RTS)
+      s-keep-pend  (has K2-RTS, should have K5-RTS)
+      s-out-tbs    (has K3-RTS, should have K7-RTS)
+      s-out-keep   (has K4-RTS, should have K8-RTS)
+      s-vanished   (has K5-RTS, should have K9-RTS)
+      s-unfinished (has K6-RTS, should have K10-RTS)
+  PORT (whole-row delete): 6 intact, 0 desynced
+```
+
+Every single surviving shipment had the wrong readiness block. **This one is
+worth raising with whoever still runs the original**, not just the port.
+
+### Other deliberate divergences
+
+1. **The execution budget is widened, not removed** (user decision). SRC stops
+   at 4.5 minutes because Apps Script kills a script at 6. The port uses 8
+   minutes against a 9-minute function timeout — and `timeoutSeconds: 540` is
+   set explicitly, because the **default for a scheduled function is 60
+   seconds**, which this cannot finish in. The mechanism is kept because it is
+   load-bearing: a board that did not finish its card list is excluded from
+   `boardsFullyProcessed`, and pruning treats "not seen this run" as "deleted
+   from Trello". Without the budget-and-exclusion pair, a slow run archives
+   live shipments.
+2. **`UrlFetchApp.fetchAll` → `Promise.all(fetch)`**; same batching shape.
+3. **Per-row `setValues` → one batched update.** SRC writes each changed row in
+   its own call inside a `forEach`. Same cells, fewer calls, no half-written
+   cycle.
+4. **Row padding** (`padRows_`), as in steps 2 and 3.
+
+### Test — `npm run test:parity:sync`
+
+```
+ran 50 comparisons across 13 scenarios
+SYNC PARITY OK — identical writes, identical surviving rows, and the
+documented A-J-compaction divergence verified
+```
+
+The fixture builds SHIPMENTS at its **real 18-column width** — a 10-column
+fixture could not show the desync at all — and the fakes on both sides
+**apply** their writes rather than only recording them. That second point
+matters: the sync runs archive and then prune against the same tab, and a
+recorder that does not mutate makes the second pass see a stale sheet, which
+produced a reported difference that had nothing to do with the port. Applying
+also makes the final sheet, K–R included, directly inspectable.
+
+Three assertions per scenario: the non-removal ops must match exactly; the
+**set of surviving shipments** must match (the mechanisms differ, the outcome
+must not); and the port must leave every surviving row owning its own K–R block.
+
+**Mutation-tested — fifteen properties, two passes.** The first caught 12 and
+**three survived** (no already-archived Trello card, no card in a Delivered list
+with a complete checklist, no short row). After adding those fixtures, the
+second pass caught **all fifteen, none survived**:
+
+| Mutation | Result |
+|---|---|
+| the K–R fix reverted to SRC's A–J compaction | 39 differences |
+| rank guard removed (Writer 1 clobbers Writer 3) | 4 differences |
+| prune ignores `boardsFullyProcessed` (archives live rows) | 6 differences |
+| archive: non-local carve-out removed | 5 differences |
+| archive: fully-received-from-summary route removed | 5 differences |
+| Burlington rename applied to known brands too | 3 differences |
+| skipped lists no longer skipped | 6 differences |
+| history gate removed (re-appends archived cards) | 6 differences |
+| vanished card: closed branch removed | 3 differences |
+| vanished card: untracked-board branch removed | 1 difference |
+| tracking harvested from description only, not comments | 3 differences |
+| `isFullyPacked` fallback removed for a Delivered inbound list | 3 differences |
+| pipeline order: date refresh before override detection (SCHEMA §4F) | 4 differences |
+| rollup engine no longer run before archive | 4 differences |
+| row padding removed | 4 differences |
+
+### What is NOT covered
+
+The Trello transport and the Sheets transport are stubbed, so this proves which
+calls are made with which payloads — not that they succeed against live APIs.
+The schedule firing, real Trello pagination, and rate-limit behaviour are all
+unverifiable here and are stated as such rather than tested around.
+
+### Everything else
+
+| Check | Result |
+|---|---|
+| `npm run lint` | 0 errors, 10 warnings (unchanged) |
+| `npm test` | ✅ exit 0 |
+| `npm run test:parity` | ✅ 57,298 comparisons, 0 differences |
+| `firebase emulators:start` | ✅ clean boot, 4 functions |

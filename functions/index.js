@@ -205,6 +205,29 @@ exports.trelloWebhook = onRequest(async (req, res) => {
   }
 });
 
-exports.scheduledSync = onSchedule("every 1 hours", async (event) => {
-  logger.info("Scheduled sync running!");
-});
+/**
+ * The 4-board master sync (SCHEMA section 7, "Writer 1").
+ *
+ * `timeoutSeconds` is NOT the default. The default for a scheduled function is
+ * 60 seconds, which this cannot finish in -- a full 4-board pull plus the
+ * rollup engine, the archive/prune pass and the whole date pipeline behind it.
+ * 540s (9 minutes) sits just above Service_Sync's own 8-minute internal budget,
+ * so the function's own budget is what stops a long run, gracefully and with a
+ * complete board list, rather than the platform killing it mid-write.
+ *
+ * The internal budget is the load-bearing half: a board that did not finish its
+ * card list is excluded from pruning, because "not seen this run" would
+ * otherwise be read as "deleted from Trello" and archive live shipments.
+ */
+exports.scheduledSync = onSchedule(
+    {schedule: "every 1 hours", timeoutSeconds: 540, memory: "512MiB"},
+    async (event) => {
+      const result = await require('./services/Service_Sync')
+          .syncAllBoardsToShipmentsTab();
+      if (!result.success) {
+        // Throwing marks the scheduled run as failed, which is what surfaces it
+        // in Cloud Scheduler and in any alerting built on it. The sync has
+        // already logged the detail.
+        throw new Error('Scheduled sync failed: ' + result.error);
+      }
+    });

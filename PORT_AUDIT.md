@@ -75,6 +75,13 @@
 > on card close, and two missing `await`s that would have made every Trello
 > comment look like a sailing-schedule declaration and killed the READY/PORT
 > feature outright.
+> **Step 4 done:** `syncAllBoardsToShipmentsTab` -> `functions/services/Service_Sync.js`,
+> and `scheduledSync` is a real scheduled function at last. 13-scenario harness,
+> mutation-tested against 15 properties. **Found and fixed a third real bug, this
+> one in the ORIGINAL and still live there:** the archive and prune paths compact
+> columns A-J on an 18-column sheet, so every shipment below an archived one
+> inherits another shipment's readiness/ETA block (K-R). Demonstrated in the
+> harness output: 6 of 6 survivors desynced on SRC, 0 on the port.
 
 > Purpose: an honest map of what is actually ported, what is stubbed, and what
 > hasn't been started — so the remaining work can be sequenced. The existing
@@ -269,7 +276,7 @@ SRC, on the same reasoning as the move paths in Unit C.
 |---|---|---|---|
 | ~~`Shared_Classifiers.js`~~ | 44KB | **PORTED (Phase 2)** to `functions/services/Shared_Classifiers.js`, with a parity harness (`npm run test:parity`, 1492 comparisons). `backfillIgnoreCommentsFromComments_` landed in Phase 4B, once `fetchCardComments_` existed to unblock it. A client-side duplicate is still needed. |
 | ~~`Webhook_Receiver.js`~~ | 33KB | **PORTED (Phase 5, step 3)** to `functions/services/Service_Webhook.js` + `functions/webhook_dedupe.js`, entry point `exports.trelloWebhook`. `npm run test:parity:webhook` (43 scenarios) + `npm run test:webhook` (24 checks), mutation-tested against 16 properties. Render proxy dropped; real Trello signature verification. `alertOnWebhookErrors`, `setupWebhooksForAllBoards` and `keepRenderAwake` deliberately not ported (all proxy/Apps-Script artefacts). |
-| `syncAllBoardsToShipmentsTab.js` | 35KB | Scheduled full board→SHIPMENTS pull | `onSchedule` (currently a no-op `scheduledSync`) |
+| ~~`syncAllBoardsToShipmentsTab.js`~~ | 35KB | **PORTED (Phase 5, step 4)** to `functions/services/Service_Sync.js`; `exports.scheduledSync` is now real (`timeoutSeconds: 540`). `npm run test:parity:sync` (13 scenarios), mutation-tested against 15 properties. **Fixes a real bug in the original:** SRC's archive/prune compact columns A-J on an 18-column sheet, so every surviving row inherits another shipment's K-R readiness/ETA data. Port deletes whole rows. |
 | ~~`evaluateRollupStatuses.js`~~ | 20KB | **PORTED (Phase 5, step 2)** to `functions/services/Service_Rollup.js`, with a 455-comparison harness (`npm run test:parity:rollup`) that diffs emitted status writes, Trello calls and emails, mutation-tested against 10 properties. Two deliberate divergences (stakeholder-email fallback, no lock) both documented and asserted. `migrateRollupStatusLabels` ported but untested (manual one-off). |
 | `pushOutboundToShippingSchedule.js` | 35KB | AEO/Burlington external-sheet → Trello push | `onSchedule` |
 | `Service_Router.js` | 12KB | Webhook routing -- **mostly dead already** (`legacyDoPost_`/`legacyProcessWebhookPayload_` are retired in SRC itself; `doGet` is superseded by SPA hosting + the Phase 3 routes). Step 6 cleanup. | folds into `Webhook_Receiver` |
@@ -299,7 +306,7 @@ Still open:
   header, so it 401s against a deployed backend. Needs the `firebase` JS SDK.
 - **Secrets are plain env vars**, not Secret Manager. Moving them is a
   deploy-topology change — needs a decision.
-- **`scheduledSync`** is `logger.info("Scheduled sync running!")` and nothing else.
+- ~~**`scheduledSync`** is a stub~~ **DONE (Phase 5, step 4)** — runs `Service_Sync.syncAllBoardsToShipmentsTab()` with an explicit 540s timeout.
 - ~~**`index.js` routes**~~ — **DONE (Phase 3)**. `/shipment`, `/po-ingest` and
   `/diagnostics` exist; see `PHASE_3_NOTES.md` §3 for the full inventory.
 - **No `/api` rewrite in `firebase.json`** (Phase 3, F9). `frontend/src/api.js`
