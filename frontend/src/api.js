@@ -1,5 +1,23 @@
 // API Layer for interacting with Firebase Cloud Functions
-const API_BASE_URL = import.meta.env.DEV ? 'http://localhost:5001/cis-warehouse-portal/us-central1/api' : '/api';
+import { getIdToken } from './auth';
+
+/**
+ * The emulator's function URL embeds the project id, so it cannot be a literal
+ * without hardcoding an environment -- which is exactly how the placeholder
+ * "cis-warehouse-portal" (a project that does not exist) ended up baked in
+ * here. It now comes from the same env var the Firebase config uses, with the
+ * old placeholder kept ONLY as an emulator fallback so local work keeps running
+ * with no .env at all.
+ *
+ * In production the base is the relative `/api`, which depends on the Hosting
+ * rewrite `{"source": "/api/**", "function": "api"}` in firebase.json. Without
+ * that rewrite every call is answered with index.html instead -- see
+ * DEPLOYMENT.md section 6.
+ */
+const EMULATOR_PROJECT = import.meta.env.VITE_FIREBASE_PROJECT_ID || 'cis-warehouse-portal';
+const API_BASE_URL = import.meta.env.DEV
+  ? `http://localhost:5001/${EMULATOR_PROJECT}/us-central1/api`
+  : '/api';
 
 /**
  * Every backend failure -- a service refusal (422), an unported call (501), an
@@ -23,6 +41,20 @@ async function fetchFromFirebase(endpoint, method = 'GET', body = null) {
       'Content-Type': 'application/json',
     },
   };
+
+  // Attach the caller's identity. Fetched per request rather than cached: the
+  // SDK refreshes the token as it nears expiry, so this is always current and
+  // cheap. See auth.js getIdToken().
+  //
+  // A null token is NOT an error here -- under the emulator with
+  // AUTH_DISABLED=true the backend accepts unauthenticated calls, which is how
+  // local development works. Against a deployed backend the same request gets a
+  // 401 carrying "Authentication required. Sign in with your work Google
+  // account.", which the error path below surfaces verbatim.
+  const token = await getIdToken();
+  if (token) {
+    options.headers.Authorization = `Bearer ${token}`;
+  }
 
   if (body) {
     options.body = JSON.stringify(body);

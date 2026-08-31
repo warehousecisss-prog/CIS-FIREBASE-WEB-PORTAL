@@ -1,6 +1,7 @@
 # Deployment Preparation
 
 **Written:** 2026-08-31, at the end of Phase 5.
+**Updated:** 2026-08-31 — frontend sign-in landed (§7).
 **Audience:** you, doing this for the first time, on a project that does not
 exist yet.
 
@@ -39,18 +40,29 @@ consider whether the old system should keep running once the new one is live.
 
 ## 1. Create the Firebase project
 
+> **You can do this right now, and the state of this folder is irrelevant.**
+> Creating a Firebase *project* happens entirely in Google's console — it is a
+> container in Google Cloud. It creates no files, touches nothing here, and does
+> not care whether your code is finished.
+>
+> The advice about "the more complete the better" almost certainly referred to
+> `firebase init`, which is a *different* thing: a CLI command that scaffolds
+> config files into your folder. **We already did that work by hand** —
+> `firebase.json` and `.firebaserc` exist and are configured. **Do not run
+> `firebase init`**; it would overwrite them.
+
 1. Go to the Firebase console and create a project. Note the **project ID** (not
    the display name) — it looks like `cis-warehouse-portal-4a1b`.
 2. Upgrade it to the **Blaze (pay-as-you-go)** plan. Cloud Functions v2 requires
    it. At this workload the cost is small, but it is not the free tier.
 
-Then replace the placeholder project name in **three** files. All three
-currently say `cis-warehouse-portal`, which is **not a real project**:
+Then replace the placeholder project name in **two** files. Both currently say
+`cis-warehouse-portal`, which is **not a real project**:
 
 | File | What to change |
 |---|---|
 | `.firebaserc` | the `default` alias |
-| `frontend/src/api.js` (line 2) | the production API base |
+| `frontend/src/api.js` | no longer hardcoded — the emulator URL now reads `VITE_FIREBASE_PROJECT_ID` (§7). Nothing to edit. |
 | `functions/package.json` | the `test:lock:emulator` script's `--project` |
 
 > **Why this matters:** deploying against a placeholder either fails outright or,
@@ -210,17 +222,49 @@ there was no project to decide it against. Now there is.
 
 ---
 
-## 7. Sign-in (currently blocking)
+## 7. Sign-in — DONE, needs your config values
 
-`frontend/src/api.js` sends no `Authorization` header, because the **Firebase JS
-SDK has not been added to the frontend** — a new dependency, which needed your
-approval.
+**No longer blocking.** The `firebase` JS SDK is installed and wired
+(2026-08-31):
 
-Until that lands, **every deployed API call returns 401.** Local development
-works via `AUTH_DISABLED=true`; that must never be set on a real project.
+- `frontend/src/auth.js` — Google sign-in, session persistence, token access
+- `frontend/src/components/AuthGate.jsx` — wraps the whole app; nothing renders
+  until someone is signed in
+- `frontend/src/api.js` — attaches `Authorization: Bearer <token>` to every
+  request
 
-This is the one item on this list that blocks a *usable* deployment. The backend
-is ready; the browser has no way to say who it is.
+**What you need to do:** copy `frontend/.env.example` to `frontend/.env` and
+fill in four values from the Firebase console (Project settings → General →
+Your apps → Web app; add one with the `</>` button if none exists).
+
+Then, in the console, enable **Authentication → Sign-in method → Google**, and
+add your Hosting domain under **Authentication → Settings → Authorized
+domains**. Without the second step, sign-in fails with an `unauthorized-domain`
+error that does not obviously point at this setting.
+
+### Three things worth knowing
+
+**Those four values are not secrets.** A Firebase web config *identifies* a
+project; it does not grant access to one. Access is decided server-side —
+`functions/auth.js` verifies the token and checks the email domain, and answers
+401 to anything else. Google publishes these values in their own quickstarts.
+They live in `.env` so an environment is not hardcoded, not because they are
+credentials. The real secrets are in `functions/.env`.
+
+**Vite inlines them at build time.** Change a value and you must rebuild, not
+just reload.
+
+**A missing config does not white-screen the app.** It renders a plain
+"Not configured" page naming exactly which variables are absent — verified in a
+browser, both states:
+
+| State | What renders |
+|---|---|
+| No config | "Not configured", listing the four missing variable names |
+| Config present, signed out | "CIS Warehouse Portal" + a Sign in with Google button |
+
+`AUTH_DISABLED=true` still bypasses the backend check for local work. **It must
+never be set on a real project.**
 
 ---
 
@@ -314,7 +358,7 @@ These are recorded rather than decided. None blocks deployment except #3.
 |---|---|---|
 | 1 | **Secrets are plain env vars**, not Secret Manager | Move `TRELLO_TOKEN`, `TRELLO_API_SECRET`, `SMTP_PASS` before real use |
 | 2 | **CORS is `origin: true`** (any origin) | Narrow to the Hosting domain. Safe today only because every route is token-gated |
-| 3 | **Frontend sign-in missing** | Add the `firebase` JS SDK. **Blocks a usable deployment** |
+| 3 | ~~Frontend sign-in missing~~ **DONE 2026-08-31** | SDK installed and wired; supply the four values in `frontend/.env` (§7) |
 | 4 | **Scanned-PDF purchase orders** | The original OCR'd scanned POs via Google Drive; the port reads text-layer PDFs only and refuses scans honestly. Needs a new dependency (Cloud Vision) if you want it back |
 | 5 | **Three writers, one status column** | The sync, the webhook and the rollup engine all write SHIPMENTS column J with no lock. Same as the original — neither widened nor narrowed. Worth deciding once real load exists |
 | 6 | **`cleanUpVacantRows` is unlocked** | Low priority; a housekeeping sweep, not a hot path |
