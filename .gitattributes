@@ -1,0 +1,29 @@
+# Normalise line endings to LF in the repository, on every platform.
+#
+# WHY THIS EXISTS
+# ---------------
+# This repo is LF throughout -- every file predating it is LF -- but it is
+# developed on Windows, where several ordinary tools rewrite a whole file to
+# CRLF as a side effect of editing one line. Python's `open(path, "w")` does it
+# silently by default; so do some editors.
+#
+# The damage is not to the code, which runs identically either way. It is to
+# review: a one-line change comes back as "every line changed", which hides the
+# actual edit and makes `git blame` useless for that file. Four files were
+# committed that way during Phase 5 before this was noticed.
+#
+# `text=auto eol=lf` makes git store LF regardless of what is on disk, so the
+# mistake cannot reach a commit again no matter which tool made it.
+* text=auto eol=lf
+
+# Binary: never touch these.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.xlsx binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
