@@ -190,6 +190,102 @@ console.log('  ' + Object.keys(CONTRACT).length + ' SRC client calls mapped, ' +
   registered.size + ' routes registered');
 
 /* ==========================================================================
+ * PART C -- Service_Router retirement (Phase 5, step 6)
+ * ==========================================================================
+ * `SRC/src/Service_Router.js` is not ported as a file. Most of it was already
+ * dead in the ORIGINAL (`legacyDoPost_` / `legacyProcessWebhookPayload_` are
+ * explicitly retired there, with a comment warning against renaming them back),
+ * and the rest is Apps Script web-app plumbing with no Cloud Functions
+ * counterpart -- `HtmlService` templating, `include()`, and the inline-script
+ * escaping that goes with them.
+ *
+ * The one part that carries real behaviour is `doGet`'s precompiled-dataset
+ * block, and the risk in "it's mostly dead" is dropping something from that
+ * block by accident. So this asserts the mapping instead of trusting it: the
+ * nine dataset names are extracted FROM SRC and matched against what
+ * `http/routes/boot.js` actually precompiles. Add a tenth dataset upstream, or
+ * drop one here, and this fails and names it.
+ * ========================================================================== */
+
+console.log('\nPART C -- Service_Router retirement');
+
+const fs = require('fs');
+const path = require('path');
+const SRC_ROUTER = path.join(__dirname, '..', '..', 'SRC/src/Service_Router.js');
+
+if (!fs.existsSync(SRC_ROUTER)) {
+  console.log('  SKIPPED -- SRC/src/Service_Router.js not present (SRC/ is gitignored).');
+} else {
+  const srcText = fs.readFileSync(SRC_ROUTER, 'utf8');
+  const bootText = fs.readFileSync(path.join(__dirname, '..', 'http/routes/boot.js'), 'utf8');
+
+  // SRC: template.precompiledX = precompileDataset_('name', ...)
+  const srcDatasets = [...srcText.matchAll(/precompileDataset_\(\s*'([^']+)'/g)].map((m) => m[1]);
+  // Port: precompile('name', ...)
+  const portDatasets = [...bootText.matchAll(/\bprecompile\(\s*'([^']+)'/g)].map((m) => m[1]);
+
+  check('SRC declares the 9 precompiled datasets this test knows about', () => {
+    assert.strictEqual(srcDatasets.length, 9,
+        'expected 9 precompileDataset_ calls in Service_Router.js, found ' +
+        srcDatasets.length + ': ' + srcDatasets.join(', '));
+  });
+
+  check('GET /boot precompiles exactly SRC\'s dataset set', () => {
+    assert.deepStrictEqual(portDatasets.slice().sort(), srcDatasets.slice().sort(),
+        'boot.js precompiles [' + portDatasets.join(', ') + '] but SRC doGet() precompiles [' +
+        srcDatasets.join(', ') + ']');
+  });
+
+  check('GET /boot is registered', () => {
+    assert.ok(registered.has('GET /boot'), 'the SPA has no batched boot route');
+  });
+
+  check('GET /boot still reports bootIssues (SRC BOOT_ISSUES_ / getBootIssues_)', () => {
+    assert.ok(/\bbootIssues\s*[:,]/.test(bootText),
+        'boot.js no longer returns bootIssues; JS_Diagnostics depends on it');
+  });
+
+  // Everything else in Service_Router, and where it went. Each entry is
+  // asserted, not just asserted-in-a-comment.
+  const RETIRED = [
+    ['doHEAD', 'exports.trelloWebhook answers HEAD with 200 (index.js)',
+      () => /req\.method === 'HEAD'/.test(fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8'))],
+    ['doGet webhook fast-path', 'exports.trelloWebhook answers GET with 200 (index.js)',
+      () => /req\.method === 'GET'/.test(fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8'))],
+    ['doGet precompiled datasets', 'GET /boot', () => registered.has('GET /boot')],
+    ['getBootIssues_', 'GET /boot -> bootIssues', () => /\bbootIssues\s*[:,]/.test(bootText)],
+    ['precompileDataset_', 'boot.js precompile()', () => /function precompile\(/.test(bootText)]
+  ];
+
+  for (const [srcName, where, verify] of RETIRED) {
+    check('Service_Router.' + srcName + ' -> ' + where, () => {
+      assert.ok(verify(), srcName + ' has no live counterpart at ' + where);
+    });
+  }
+
+  // These are dead in the ORIGINAL or have no Node counterpart. Asserting they
+  // are ABSENT from the port stops someone "helpfully" porting them later.
+  const DEAD = ['legacyDoPost_', 'legacyProcessWebhookPayload_', 'include', 'safeJsonForScriptTag_'];
+  const portSource = ['services', 'http', '.'].flatMap((dir) => {
+    const d = path.join(__dirname, '..', dir);
+    return fs.readdirSync(d, {withFileTypes: true})
+        .filter((e) => e.isFile() && e.name.endsWith('.js'))
+        .map((e) => fs.readFileSync(path.join(d, e.name), 'utf8'));
+  }).join('\n');
+
+  for (const name of DEAD) {
+    check('Service_Router.' + name + ' stays unported (dead in SRC, or no Node equivalent)', () => {
+      assert.ok(!new RegExp('function\\s+' + name + '\\s*\\(').test(portSource),
+          name + ' has been ported; it is dead code in the original ' +
+          '(or Apps Script plumbing) and should not exist here');
+    });
+  }
+
+  console.log('  ' + srcDatasets.length + ' precompiled datasets matched, ' +
+    RETIRED.length + ' functions re-homed, ' + DEAD.length + ' confirmed dead');
+}
+
+/* ==========================================================================
  * PART B -- the wrapper contract, over real HTTP
  * ========================================================================== */
 

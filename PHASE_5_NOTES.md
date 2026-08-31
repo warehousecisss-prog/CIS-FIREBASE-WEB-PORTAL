@@ -703,3 +703,91 @@ unverifiable here and are stated as such rather than tested around.
 | `npm test` | ✅ exit 0 |
 | `npm run test:parity` | ✅ 57,298 comparisons, 0 differences |
 | `firebase emulators:start` | ✅ clean boot, 4 functions |
+
+---
+
+## Step 5 — `pushOutboundToShippingSchedule` (DEFERRED, by decision)
+
+Not started. The user is handling it at deployment time, since it is the one
+unit that cannot be finished without live access: it reads two **external**
+Google Sheets (the AEO sheet Power Automate updates, and the Burlington sheet a
+local Python script uploads) and pushes cards to Trello.
+
+It is genuinely independent — a one-way push from those sheets to Trello that
+never touches SHIPMENTS — so nothing else waits on it. What it will need is in
+`DEPLOYMENT.md` under "When you want the AEO / Burlington push".
+
+## Step 6 — `Service_Router` retirement (DONE)
+
+Not a port. `SRC/src/Service_Router.js` is 286 lines of which almost nothing is
+live, and the risk in "mostly dead" is dropping the part that isn't. So rather
+than deleting by eye, the mapping is now **machine-checked** — `PART C` of
+`npm run test:routes`, which extracts the dataset list **from SRC** and compares
+it against what the port actually serves.
+
+### Where each piece went
+
+| `Service_Router.js` | Disposition |
+|---|---|
+| `doHEAD` | `exports.trelloWebhook` answers HEAD with 200 (step 3) |
+| `doGet` webhook fast-path | `exports.trelloWebhook` answers GET with 200 (step 3) |
+| `doGet` precompiled datasets | `GET /boot` (Phase 3) — all nine, same fallbacks |
+| `BOOT_ISSUES_` / `getBootIssues_` | `GET /boot` → `bootIssues` |
+| `precompileDataset_` | `boot.js` → `precompile()` |
+| `doGet` `?page=injector` | SPA route `/trello-injector` |
+| `legacyDoPost_` | **Dead in the ORIGINAL** — explicitly retired there, with a comment warning against renaming it back |
+| `legacyProcessWebhookPayload_` | **Dead in the ORIGINAL**, same note |
+| `include()` | Apps Script `HtmlService` templating; Vite bundles the SPA |
+| `safeJsonForScriptTag_` | **Structurally unnecessary** — see below |
+
+### Why `safeJsonForScriptTag_` is not ported, checked rather than assumed
+
+AUDIT D3 is a real finding: `JSON.stringify` does not escape `<`, U+2028 or
+U+2029, so a cell containing `</script` inlined into an inline `<script>` block
+ends the tag early and breaks the whole page load with no error anywhere.
+
+That vulnerability needs an **inline-script injection point**, and the port has
+none: boot data crosses as an `application/json` response body
+(`frontend/src/api.js` → `getBootDataset: () => fetchFromFirebase('/boot')`),
+parsed by the client. Verified there is no `innerHTML`,
+`dangerouslySetInnerHTML`, or HTML-with-interpolated-data anywhere in
+`functions/` or `frontend/src`. React escapes text nodes by default on top of
+that. The escaping helper has nothing to protect, so porting it would be cargo.
+
+**If that ever changes** — if anything starts inlining server data into markup —
+this decision has to be revisited, which is why it is written down rather than
+silently omitted.
+
+### The check
+
+`PART C` of `npm run test:routes` (95 checks total now, up from 82):
+
+- the nine dataset names are read out of `SRC/src/Service_Router.js` and must
+  match `boot.js` exactly — **add a tenth upstream or drop one here and it
+  fails, naming it**
+- `GET /boot` is registered and still returns `bootIssues`
+- each re-homed function has a verified live counterpart
+- the four dead functions are asserted **absent** from the port, so nobody
+  "helpfully" ports them back later
+
+Skips cleanly when `SRC/` is absent, like the parity harnesses.
+
+**Mutation-tested — four mutations, all caught** (the first pass let one
+through: the `bootIssues` check matched the word in a comment, so it survived
+the field being deleted from the response. Tightened to match the actual
+property):
+
+| Mutation | Result |
+|---|---|
+| a precompiled dataset dropped from `/boot` | 1 failure |
+| `bootIssues` removed from the response | 2 failures |
+| a dataset renamed (drifts from SRC) | 1 failure |
+| a dead `Service_Router` function ported back in | 1 failure |
+
+### One frontend gap recorded
+
+`doGet`'s `?page=rxo` served `RXO_Test.html`, a standalone RXO Connect API test
+bench. There is **no SPA route for it** — `frontend/src/App.jsx` has no `/rxo`.
+That is a frontend gap, not a `Service_Router` one (the backend `Service_RXO` is
+~80% ported), and it belongs with the rest of the frontend work. Recorded here
+because this is where it was noticed.

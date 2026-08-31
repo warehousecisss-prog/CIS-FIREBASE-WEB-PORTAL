@@ -82,6 +82,12 @@
 > columns A-J on an 18-column sheet, so every shipment below an archived one
 > inherits another shipment's readiness/ETA block (K-R). Demonstrated in the
 > harness output: 6 of 6 survivors desynced on SRC, 0 on the port.
+> **Step 6 done:** `Service_Router` retired — nothing to port (its live half was
+> already covered by `GET /boot` in Phase 3 and by `trelloWebhook` in step 3),
+> but the mapping is now machine-checked rather than asserted by eye, and
+> mutation-tested. **Step 5 (`pushOutboundToShippingSchedule`) deferred by
+> decision** — the user is handling it at deployment, since it needs live access
+> to two external spreadsheets. See `DEPLOYMENT.md`.
 
 > Purpose: an honest map of what is actually ported, what is stubbed, and what
 > hasn't been started — so the remaining work can be sequenced. The existing
@@ -279,7 +285,7 @@ SRC, on the same reasoning as the move paths in Unit C.
 | ~~`syncAllBoardsToShipmentsTab.js`~~ | 35KB | **PORTED (Phase 5, step 4)** to `functions/services/Service_Sync.js`; `exports.scheduledSync` is now real (`timeoutSeconds: 540`). `npm run test:parity:sync` (13 scenarios), mutation-tested against 15 properties. **Fixes a real bug in the original:** SRC's archive/prune compact columns A-J on an 18-column sheet, so every surviving row inherits another shipment's K-R readiness/ETA data. Port deletes whole rows. |
 | ~~`evaluateRollupStatuses.js`~~ | 20KB | **PORTED (Phase 5, step 2)** to `functions/services/Service_Rollup.js`, with a 455-comparison harness (`npm run test:parity:rollup`) that diffs emitted status writes, Trello calls and emails, mutation-tested against 10 properties. Two deliberate divergences (stakeholder-email fallback, no lock) both documented and asserted. `migrateRollupStatusLabels` ported but untested (manual one-off). |
 | `pushOutboundToShippingSchedule.js` | 35KB | AEO/Burlington external-sheet → Trello push | `onSchedule` |
-| `Service_Router.js` | 12KB | Webhook routing -- **mostly dead already** (`legacyDoPost_`/`legacyProcessWebhookPayload_` are retired in SRC itself; `doGet` is superseded by SPA hosting + the Phase 3 routes). Step 6 cleanup. | folds into `Webhook_Receiver` |
+| ~~`Service_Router.js`~~ | 12KB | **RETIRED (Phase 5, step 6)** — not ported as a file, and the mapping is machine-checked by `PART C` of `npm run test:routes`: the nine precompiled datasets are extracted FROM SRC and matched against `GET /boot`, each re-homed function has a verified counterpart, and the four dead ones are asserted ABSENT. `legacyDoPost_`/`legacyProcessWebhookPayload_` were already dead in SRC; `include`/`safeJsonForScriptTag_` are Apps Script plumbing with no injection surface here (verified). | done |
 | `Fedex_Master_Script.js` | 31KB | FedEx MPS discovery/tracking | service module |
 | `Setup_Registry.js` | 68KB | One-off manual repair scripts | low priority — port on demand |
 | `updateHtsDataSheet.js`, `checkFederalRegisterForTariffChanges.js`, `OneDrive_Graph_Sync.gs.js` | — | HTS/tariff + OneDrive sync | low priority |
