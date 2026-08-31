@@ -154,12 +154,28 @@ const SPEC = {
   },
 
   // --- Webhook -------------------------------------------------------------
-  WEBHOOK_HOP_SECRET: {
+  // RETIRED: WEBHOOK_HOP_SECRET. It authenticated the Render.com proxy hop,
+  // which existed only because Apps Script's doPost(e) cannot read request
+  // headers and so could never verify Trello's own signature (AUDIT D2). Cloud
+  // Functions reads headers, so the proxy is gone (Phase 5 decision) and the
+  // two keys below replace it with the real thing. Left documented rather than
+  // silently deleted so an old .env carrying it is explicable.
+  TRELLO_API_SECRET: {
     secret: true,
-    desc: 'Shared secret for the Render -> backend webhook hop, compared constant-time. ' +
-          'SRC: Webhook_Receiver.js:93. Optional BY DESIGN -- when unset the check is ' +
-          'skipped entirely, because enabling it before Render sends ?k= would silently ' +
-          'drop every webhook, and a dropped webhook is unrecoverable (SCHEMA 63, AUDIT D2).'
+    desc: 'Trello OAuth secret from trello.com/app-key, used to verify the ' +
+          'x-trello-webhook signature (base64 HMAC-SHA1 over body + callback URL). ' +
+          'Optional BY DESIGN, same reasoning SRC applied to WEBHOOK_HOP_SECRET: when ' +
+          'unset the check is skipped and a warning is logged, because enabling ' +
+          'verification against a mismatched WEBHOOK_CALLBACK_URL would silently reject ' +
+          'EVERY webhook, and a rejected webhook is unrecoverable (SCHEMA 63). Set both ' +
+          'this and WEBHOOK_CALLBACK_URL together, and confirm real deliveries land.'
+  },
+  WEBHOOK_CALLBACK_URL: {
+    desc: 'The exact callback URL registered with Trello for this webhook, e.g. ' +
+          'https://<region>-<project>.cloudfunctions.net/trelloWebhook. Trello signs ' +
+          'body + THIS STRING, so it must match the registered value byte for byte -- a ' +
+          'trailing slash difference fails every signature. Only read when ' +
+          'TRELLO_API_SECRET is set.'
   },
 
   // --- HTS / tariff tooling (low priority, not yet ported) ------------------

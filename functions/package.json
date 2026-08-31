@@ -8,8 +8,9 @@
     "start": "npm run shell",
     "deploy": "firebase deploy --only functions",
     "logs": "firebase functions:log",
-    "test:parity": "node test/parity_Shared_Classifiers.js && node test/parity_Service_Dates.js && node test/parity_Service_Conversions.js && node test/parity_Aging.js && node test/parity_Service_Assembly.js && node test/parity_CommitAtomic.js && node test/parity_Rollup.js",
+    "test:parity": "node test/parity_Shared_Classifiers.js && node test/parity_Service_Dates.js && node test/parity_Service_Conversions.js && node test/parity_Aging.js && node test/parity_Service_Assembly.js && node test/parity_CommitAtomic.js && node test/parity_Rollup.js && node test/parity_Webhook.js",
     "test:parity:rollup": "node test/parity_Rollup.js",
+    "test:parity:webhook": "node test/parity_Webhook.js",
     "test:parity:assembly": "node test/parity_Service_Assembly.js",
     "test:parity:commit": "node test/parity_CommitAtomic.js",
     "test:parity:aging": "node test/parity_Aging.js",
@@ -17,8 +18,9 @@
     "test:parity:dates": "node test/parity_Service_Dates.js",
     "test:routes": "node test/routes_contract.js",
     "test:lock": "node test/lock_contract.js",
+    "test:webhook": "node test/webhook_contract.js",
     "test:lock:emulator": "firebase emulators:exec --only firestore --project cis-warehouse-portal \"node test/lock_contract.js\"",
-    "test": "npm run test:parity && npm run test:routes && npm run test:lock"
+    "test": "npm run test:parity && npm run test:routes && npm run test:lock && npm run test:webhook"
   },
   "engines": {
     "node": "22"

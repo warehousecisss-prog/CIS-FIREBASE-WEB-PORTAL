@@ -234,6 +234,34 @@ function resolveTransitModeFromText_(text) {
 }
 
 /**
+ * A card's transit mode, list name taking priority over its labels. Falls back
+ * to "Standard / Ground" when neither says anything.
+ *
+ * Lives here rather than in a caller for the same reason formatInboundLineItems
+ * does: both the scheduled sync and the real-time webhook need it, and one
+ * definition is what stops the two writers disagreeing about the same card.
+ * Ported verbatim from syncAllBoardsToShipmentsTab.js -- `labels` is indexed
+ * without a null guard there, and every SRC caller passes `card.labels || []`,
+ * so the guard stays the caller's job here too.
+ *
+ * @param {string} listName
+ * @param {Array<{name: string}>} labels
+ * @return {string}
+ */
+function resolveTransitMode(listName, labels) {
+  // 1. Check list name first (highest priority)
+  const fromList = resolveTransitModeFromText_(listName);
+  if (fromList) return fromList;
+
+  // 2. Fall back to labels if list doesn't explicitly state transit mode
+  const labelsUpper = labels.map((l) => l.name).join(' ');
+  const fromLabels = resolveTransitModeFromText_(labelsUpper);
+  if (fromLabels) return fromLabels;
+
+  return 'Standard / Ground';
+}
+
+/**
  * Returns true if the given label/text matches any brand's Regex_Aliases in a
  * CUSTOMER_REGISTRY export (see getCustomerRegistry() in Service_Read.js).
  *
@@ -1224,6 +1252,7 @@ module.exports = {
   isFullyReceivedFromSummaryServer_,
   getRollupRank_,
   resolveTransitModeFromText_,
+  resolveTransitMode,
   // Brand / origin classification
   isKnownBrandLabel_,
   classifyInboundOrderOriginServer_,

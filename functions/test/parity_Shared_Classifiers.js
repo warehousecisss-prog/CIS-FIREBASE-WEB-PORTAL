@@ -301,6 +301,16 @@ const TRACKING_VALS = [
 cmp('cleanTrackingNumber', sandbox.cleanTrackingNumber, port.cleanTrackingNumber,
     one(TRACKING_VALS));
 
+// resolveTransitMode -- list name wins over labels, "Standard / Ground" when
+// neither says anything. Needed by both the sync and the webhook (Phase 5).
+const TRANSIT_LABEL_SETS = [
+  [], [{name: 'OCEAN FREIGHT'}], [{name: 'AIR'}], [{name: 'FEDEX'}],
+  [{name: 'GROUND'}], [{name: 'TRUCK'}], [{name: 'Scorpion'}],
+  [{name: 'SEA SHIP'}, {name: 'AIR'}], [{name: ''}]
+];
+cmp('resolveTransitMode', sandbox.resolveTransitMode, port.resolveTransitMode,
+    pairs(LIST_NAMES, TRANSIT_LABEL_SETS).map(([l, labels]) => [l, labels]));
+
 // ---- second round: with the PRODUCT identity index POPULATED ---------------
 // This is the case the port had to restructure for: SRC reads the PRODUCT sheet
 // synchronously inside productIdentityKey_, the port cannot, so the load is
@@ -346,7 +356,7 @@ port.primeQbNameIndex(true).then(() => {
 
 function report() {
 
-console.log(`\nran ${checks} comparisons across 23 functions`);
+console.log(`\nran ${checks} comparisons across 24 functions`);
 if (failures.length === 0) {
   console.log('PARITY OK — every output identical to SRC\n');
 } else {

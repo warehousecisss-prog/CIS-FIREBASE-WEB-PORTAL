@@ -63,6 +63,18 @@
 > column J (see `padRows_`). Also closed a previously-unrecorded gap in
 > `markFedExChildDeliveredInSheet`, which was missing SRC's post-write rollup
 > refresh + cache warm. Not client-callable, so no route.
+> **Step 3 done:** `Webhook_Receiver` -> `functions/services/Service_Webhook.js`
+> + `functions/webhook_dedupe.js` + `exports.trelloWebhook` (SCHEMA S13). The
+> Render.com proxy is GONE -- the function verifies Trello's real signature
+> itself, which Apps Script never could. De-bounce moved to Firestore, still
+> keyed on the event hash (SCHEMA #43), byte-identical key to SRC. 43-scenario
+> parity harness + 24-check contract test; mutation-tested against 16
+> properties in two passes (the first pass found five corpus blind spots).
+> Found two real bugs, both introduced by this port and both caught: a
+> `batchDeleteRows` off-by-one that would have deleted the wrong SHIPMENTS row
+> on card close, and two missing `await`s that would have made every Trello
+> comment look like a sailing-schedule declaration and killed the READY/PORT
+> feature outright.
 
 > Purpose: an honest map of what is actually ported, what is stubbed, and what
 > hasn't been started — so the remaining work can be sequenced. The existing
@@ -256,11 +268,11 @@ SRC, on the same reasoning as the move paths in Unit C.
 | File | Size | Role | Port target |
 |---|---|---|---|
 | ~~`Shared_Classifiers.js`~~ | 44KB | **PORTED (Phase 2)** to `functions/services/Shared_Classifiers.js`, with a parity harness (`npm run test:parity`, 1492 comparisons). `backfillIgnoreCommentsFromComments_` landed in Phase 4B, once `fetchCardComments_` existed to unblock it. A client-side duplicate is still needed. |
-| `Webhook_Receiver.js` | 33KB | Real-time Trello card-update webhook | `onRequest` function |
+| ~~`Webhook_Receiver.js`~~ | 33KB | **PORTED (Phase 5, step 3)** to `functions/services/Service_Webhook.js` + `functions/webhook_dedupe.js`, entry point `exports.trelloWebhook`. `npm run test:parity:webhook` (43 scenarios) + `npm run test:webhook` (24 checks), mutation-tested against 16 properties. Render proxy dropped; real Trello signature verification. `alertOnWebhookErrors`, `setupWebhooksForAllBoards` and `keepRenderAwake` deliberately not ported (all proxy/Apps-Script artefacts). |
 | `syncAllBoardsToShipmentsTab.js` | 35KB | Scheduled full board→SHIPMENTS pull | `onSchedule` (currently a no-op `scheduledSync`) |
 | ~~`evaluateRollupStatuses.js`~~ | 20KB | **PORTED (Phase 5, step 2)** to `functions/services/Service_Rollup.js`, with a 455-comparison harness (`npm run test:parity:rollup`) that diffs emitted status writes, Trello calls and emails, mutation-tested against 10 properties. Two deliberate divergences (stakeholder-email fallback, no lock) both documented and asserted. `migrateRollupStatusLabels` ported but untested (manual one-off). |
 | `pushOutboundToShippingSchedule.js` | 35KB | AEO/Burlington external-sheet → Trello push | `onSchedule` |
-| `Service_Router.js` | 12KB | Webhook routing | folds into `Webhook_Receiver` |
+| `Service_Router.js` | 12KB | Webhook routing -- **mostly dead already** (`legacyDoPost_`/`legacyProcessWebhookPayload_` are retired in SRC itself; `doGet` is superseded by SPA hosting + the Phase 3 routes). Step 6 cleanup. | folds into `Webhook_Receiver` |
 | `Fedex_Master_Script.js` | 31KB | FedEx MPS discovery/tracking | service module |
 | `Setup_Registry.js` | 68KB | One-off manual repair scripts | low priority — port on demand |
 | `updateHtsDataSheet.js`, `checkFederalRegisterForTariffChanges.js`, `OneDrive_Graph_Sync.gs.js` | — | HTS/tariff + OneDrive sync | low priority |

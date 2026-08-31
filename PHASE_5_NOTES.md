@@ -362,3 +362,209 @@ its write. SRC has no protection and the port neither widens nor narrows the
 race. Worth a decision once the webhook lands in step 3 — the options are a
 second (non-Inventory) lease, or making the sync the only caller. **Not decided
 here.**
+
+---
+
+## Step 3 — `Webhook_Receiver`, the real-time webhook (DONE)
+
+Three new files:
+
+| File | Role |
+|---|---|
+| `functions/services/Service_Webhook.js` | `processWebhookPayload`, `archiveClosedCardNow_`, `logWebhookError_`, `verifyTrelloSignature` |
+| `functions/webhook_dedupe.js` | The Firestore event de-bounce — `lock.js`'s sibling, same disposable-scaffolding discipline |
+| `functions/index.js` → `exports.trelloWebhook` | The HTTP entry point, outside the Express app (Trello sends no Firebase token) |
+
+### The Render proxy is gone
+
+SRC bounced every Trello webhook through a free Render.com server and
+authenticated only that hop with a shared `?k=` secret. That existed for exactly
+one reason: Apps Script's `doPost(e)` **cannot read request headers**, so it
+could never check Trello's real signature. Cloud Functions can, so
+`verifyTrelloSignature()` does the real check — `base64(HMAC-SHA1(apiSecret,
+rawBody + callbackURL))` against the `x-trello-webhook` header — and a sleeping
+free-tier server, plus the 5-minute cron that existed only to keep it awake,
+leave the topology entirely. `WEBHOOK_HOP_SECRET` is retired;
+`TRELLO_API_SECRET` + `WEBHOOK_CALLBACK_URL` replace it.
+
+It is **inert until both are configured**, on the same reasoning SRC applied to
+its hop secret and for a sharper reason: Trello signs *over the callback URL*,
+so a `WEBHOOK_CALLBACK_URL` differing by a trailing slash rejects every
+delivery, and a rejected webhook is unrecoverable. Set both together, then
+confirm real deliveries land.
+
+### The de-bounce
+
+Moved from `CacheService` to a small Firestore claim record, same 20s TTL, same
+event-hash key. **The key hashes the action, not the card** — SCHEMA invariant
+#43, which exists because the card-scoped version caused a real incident (PO
+3571: a checklist event and the follow-up card-move collided inside the 3-second
+window, the move was dropped, and the shipment showed a stale status for hours).
+The port's key is byte-identical to SRC's, and that is asserted directly.
+
+It **fails open** where `lock.js` fails open grudgingly, because the asymmetry
+here is stark: a wrongly-dropped webhook is unrecoverable (Trello will not
+re-send), while a wrongly-processed duplicate costs a little wasted work against
+an idempotent handler.
+
+**One deploy step to remember:** set a Firestore TTL policy on the
+`webhook_dedupe` collection's `expiresAt` field, alongside "enable Firestore".
+Without it the collection grows by one ~120-byte document per distinct Trello
+event forever. Nothing breaks — reads are by document id — it is tidiness, not
+correctness.
+
+### Two real bugs found, both mine, both caught by the harness
+
+**1. An off-by-one that would have deleted the wrong shipment.**
+`SS_API.batchDeleteRows` takes **1-based sheet row numbers** (it computes
+`startIndex = rowNum - 1`), which is what every existing caller passes
+(`Service_Write.js:716`). `archiveClosedCardNow_`'s `rowIdx` indexes the *body*
+of the sheet, so the sheet row is `rowIdx + 2`. I passed `rowIdx + 1`.
+
+**Failure scenario:** close a Trello card, and the portal archives the right row
+to history but deletes **the row above it** from SHIPMENTS — silently losing a
+different, live shipment while the closed one stays put.
+
+Worse, my first version of the harness *hid it*: the recording stub did
+`i => i + 1`, which made the numbers line up. A recorder that massages values to
+match is worse than no recorder — it converts a caught bug into a passing test.
+The stub now records exactly what the caller passed, and that is noted in the
+file so it does not get "helpfully" adjusted again.
+
+**2. Two missing `await`s that would have killed the READY/PORT feature.**
+`parseSailingScheduleComment_` and `parseReadyPortComment_` are `async` in the
+port (they await `classifyPortGroup_`, which reads a sheet) but synchronous in
+SRC. My call site forgot to await them. An un-awaited async call returns a
+**Promise, which is always truthy**, so:
+
+- every Trello comment — "hello" included — looked like a sailing-schedule
+  declaration and fired `applySailingScheduleDeclaration_` with `undefined`
+  dates, and
+- the READY/PORT branch, sitting in the `else`, would **never have run at all**.
+
+Both parsers turn out to be absent from `parity_Service_Dates.js` too, so they
+have no direct SRC comparison anywhere — recorded below as a coverage gap.
+
+### A harness flaw worth recording, because it made three scenarios vacuous
+
+Patching `require.cache[...].exports.trelloFetch_` looks like a working stub and
+is not: a CommonJS module's **internal** calls resolve against its own module
+scope, never through its exports object. `applyIgnoreDeclaration_` therefore
+kept calling the real `trelloFetch_`, reached for the network, failed, and
+returned `null` — while SRC's equivalent (`UrlFetchApp.fetch`, which the sandbox
+stubbed with a *thrower*) also failed and also returned `null`. Both sides broke
+identically, the diff stayed empty, and the three `.ignore` scenarios were
+proving nothing.
+
+Fixed by stubbing the **transport** on both sides — `global.fetch` for the port,
+a recording `UrlFetchApp.fetch` for SRC. Separately, SRC's `trelloCreds_` lives
+in `Service_Dates.js`, which this sandbox does not load, so it had been throwing
+a `ReferenceError` into its own catch; the sandbox now supplies it.
+
+### Deliberate divergences
+
+1. **`alertOnWebhookErrors` not ported.** A daily digest of the Webhook_Errors
+   tab, which exists in SRC only because a failed webhook was otherwise
+   invisible. Cloud Logging makes alerting a platform feature rather than a mail
+   loop this code runs. The durable **Webhook_Errors tab is still written** —
+   its real value is keeping the raw payload for replay.
+2. **`setupWebhooksForAllBoards` / `keepRenderAwake` not ported.** Both are
+   Render-proxy artefacts. Registration is now a one-off setup step against the
+   new endpoint.
+3. **Malformed JSON returns 400, not 200.** The Functions runtime's body parser
+   rejects it before the handler is entered — verified against the emulator, not
+   assumed. Arguably better (a truncated delivery is exactly the case a retry
+   fixes) but it does mean the "always 2xx" contract has a hole and a malformed
+   payload is not captured to Webhook_Errors.
+
+### Tests
+
+```
+npm run test:parity:webhook  →  43 scenario comparisons, 0 differences
+npm run test:webhook         →  24 checks, 0 failures
+```
+
+The parity harness compares **what each side does**: the row upsert (update
+range or append, cell for cell), the idempotency skip (an unchanged row must
+emit *no* write), the archive path (history append **and** the SHIPMENTS
+delete), every Trello call, and the readiness side-effects. 43 scenarios cover
+list-skips, board/direction resolution, all seven rollup-status branches, the
+rank guard, both append-skip rules including SCHEMA invariant #10, five
+card-closed variants, four `.ignore` variants, and four due-date override
+variants.
+
+Two scenarios exist specifically to pin **SCHEMA §4F's ordering constraint**: a
+comment on a row whose A–J data is byte-identical, so the write is skipped and
+the readiness side-effect must fire *anyway*. Move the readiness block below the
+idempotency return and those go red.
+
+**Mutation-tested — sixteen properties, in two passes.** The first pass caught
+9 of 14 and **five survived**, which is the whole reason to run it: the survivors
+were corpus blind spots (no outbound `Check*` event, no evening-UTC due date, no
+short row, and the vacuous `.ignore` scenarios above). After closing those gaps
+and adding the two `await` mutations, the second pass caught **all fifteen, none
+survived**:
+
+| Mutation | Result |
+|---|---|
+| archive delete off-by-one (the bug the harness once masked) | 4 differences |
+| readiness moved below the idempotency return (SCHEMA §4F) | 2 differences |
+| rank guard removed | 1 difference |
+| idempotency check defeated | 3 differences |
+| board resolved by live Trello name, not id (the 2026-08-13 bug) | 29 differences |
+| inbound entity uses store extraction instead of the raw card name | 23 differences |
+| append-skip also excludes DELIVERED (breaks SCHEMA #10) | 1 difference |
+| `isFullyPacked` fallback removed for a Delivered inbound list | 1 difference |
+| checklists never fetched for `Check*` on an outbound card | 1 difference |
+| due date formatted in UTC instead of America/New_York | 1 difference |
+| row padding removed | 1 difference |
+| ignore result not reflected into `card.labels` this pass | 2 differences |
+| archive non-local carve-out removed | 1 difference |
+| sailing parser not awaited (bug 2 above) | 7 differences |
+| READY/PORT parser not awaited | 7 differences |
+
+One mutation (`if (action.data.list)` → `if (true)`) was dropped as an
+**equivalent mutant**: the fallback list name is `"Unknown List"`, which matches
+neither skip keyword, so the two forms are behaviourally identical. Recorded
+rather than silently omitted.
+
+The contract test covers what parity cannot: the de-bounce key **is** compared
+to SRC byte-for-byte (including SRC's signed-byte hex conversion, reproduced so
+it is actually exercised), and the store and signature checks are tested against
+their specification — first-claim vs duplicate, TTL expiry, fail-open on an
+unreachable *and* on a hanging store, and for signatures: inert-until-configured,
+correct signature, wrong signature, missing header, tampered body, a same-length
+wrong signature (so a length-only comparison cannot pass), and a callback URL
+differing by a trailing slash.
+
+### Emulator smoke test
+
+Verifiable without credentials, because these paths fail before any Sheets call:
+
+| Request | Response |
+|---|---|
+| `HEAD` (Trello's registration probe) | `200` |
+| `GET` | `200 Trello Webhook Active` |
+| `POST` empty body | `200 OK - No Data` |
+| `POST` non-card event | `200 OK - Ignored` |
+| `PUT` | `200 OK - Ignored` |
+| `POST` malformed JSON | `400` (platform body parser — see divergence 3) |
+
+### Everything else
+
+| Check | Result |
+|---|---|
+| `npm run lint` | 0 errors, 10 warnings (unchanged) |
+| `npm test` (full suite) | ✅ exit 0 |
+| `npm run test:parity` | ✅ 57,248 comparisons, 0 differences |
+| `npm run test:routes` | ✅ 82 checks (unchanged — the webhook is not an SPA route) |
+| `firebase emulators:start` | ✅ clean boot, **4** functions |
+
+### Coverage gap recorded, not closed
+
+`parseSailingScheduleComment_` and `parseReadyPortComment_` are absent from
+`parity_Service_Dates.js` and have **no direct SRC comparison anywhere**. The
+webhook harness exercises which *branch* they drive, not whether they parse
+correctly. Worth adding to the Service_Dates harness — they are pure and
+trivially comparable — flagged rather than done here to keep this step's diff
+about the webhook.
